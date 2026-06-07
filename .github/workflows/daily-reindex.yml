@@ -1,0 +1,27 @@
+name: Daily Wiki Reindex
+
+on:
+  schedule:
+    # 每天北京时间凌晨 3:00 (UTC+8) = UTC 19:00
+    - cron: "0 19 * * *"
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  reindex:
+    name: Trigger Wiki Reindex
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call rebuild-index endpoint
+        run: |
+          HTTP_CODE=$(curl -s -o /tmp/reindex_response.json -w "%{http_code}" \
+            -X POST "${{ secrets.APP_BASE_URL }}/admin/rebuild-index?secret=${{ secrets.REBUILD_INDEX_SECRET }}")
+
+          echo "HTTP Status: $HTTP_CODE"
+          cat /tmp/reindex_response.json
+
+          if [ "$HTTP_CODE" != "202" ]; then
+            echo "❌ Reindex failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+          echo "✅ Reindex triggered successfully"

@@ -27,15 +27,14 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-
-# 确保项目根目录在 sys.path
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv("env", override=False)
+# 确保项目根目录在 sys.path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+load_dotenv(".env", override=False)
 
 from src.rag.feishu_wiki import fetch_all_wiki_documents, list_wiki_spaces
 from src.rag.document_loader import split_documents

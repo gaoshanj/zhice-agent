@@ -44,5 +44,8 @@ class Settings(BaseSettings):
     app_port: int = 8080
     log_level: str = "INFO"
 
+    # 管理接口（定时重建索引等）
+    rebuild_index_secret: str = ""  # 用于保护 /admin/rebuild-index
+
 
 settings = Settings()
