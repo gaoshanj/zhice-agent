@@ -1,0 +1,24 @@
+version: "3.9"
+
+services:
+  zhice-agent:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    ports:
+      - "8080:8080"
+    env_file:
+      - ../.env
+    volumes:
+      - chroma_data:/app/chroma_data
+      - logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  chroma_data:
+  logs:
