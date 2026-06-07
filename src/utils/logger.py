@@ -1,20 +1,41 @@
-"""统一日志配置"""
+"""统一日志配置（基于标准库 logging）"""
+from __future__ import annotations
 
+import logging
 import sys
-from loguru import logger
+import os
+from logging.handlers import RotatingFileHandler
 
-logger.remove()
-logger.add(
-    sys.stderr,
-    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{line}</cyan> — <level>{message}</level>",
-    level="INFO",
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+_formatter = logging.Formatter(
+    fmt="%(asctime)s | %(levelname)-8s | %(name)s:%(lineno)d — %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger.add(
+
+# 控制台输出
+_console = logging.StreamHandler(sys.stderr)
+_console.setLevel(LOG_LEVEL)
+_console.setFormatter(_formatter)
+
+# 文件输出（生产环境）
+os.makedirs("logs", exist_ok=True)
+_file = RotatingFileHandler(
     "logs/zhice-agent.log",
-    rotation="10 MB",
-    retention="30 days",
-    compression="zip",
-    level="DEBUG",
+    maxBytes=10 * 1024 * 1024,
+    backupCount=5,
+    encoding="utf-8",
 )
+_file.setLevel(logging.DEBUG)
+_file.setFormatter(_formatter)
+
+logger = logging.getLogger("zhice-agent")
+logger.setLevel(LOG_LEVEL)
+logger.handlers.clear()
+logger.addHandler(_console)
+if os.environ.get("ENV") == "production":
+    logger.addHandler(_file)
+
+logger.propagate = False
 
 __all__ = ["logger"]
