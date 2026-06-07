@@ -1,4 +1,4 @@
-"""报告生成主逻辑 — Phase 1（无 RAG，直接调用 LLM）"""
+"""报告生成主逻辑 — Phase 2（RAG 接入飞书 Wiki）"""
 
 from __future__ import annotations
 
@@ -107,8 +107,24 @@ async def _generate_section(
     template_vars: dict[str, Any],
     max_retries: int = 2,
 ) -> str:
-    """生成单个章节，带重试逻辑"""
-    messages = build_section_messages(section_num, **template_vars)
+    """生成单个章节，带重试逻辑（Phase 2：接入 RAG）"""
+    # RAG 检索：根据公司名 + 章节主题检索飞书 Wiki 相关知识
+    from src.rag.retriever import retrieve_for_report, format_rag_context
+
+    company = template_vars.get("company", "")
+    contexts = retrieve_for_report(company, section_num)
+    rag_context = format_rag_context(contexts)
+
+    if rag_context:
+        logger.info(f"第 {section_num} 节已注入 RAG 上下文（{len(contexts)} 条）")
+    else:
+        logger.debug(f"第 {section_num} 节无 RAG 结果")
+
+    messages = build_section_messages(
+        section_num=section_num,
+        rag_context=rag_context,
+        **template_vars,
+    )
 
     for attempt in range(1, max_retries + 2):  # 首次 + max_retries 次重试
         try:

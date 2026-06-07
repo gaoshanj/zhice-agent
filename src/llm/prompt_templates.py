@@ -213,6 +213,7 @@ def build_section_messages(section_num: int, **kwargs) -> list[dict]:
     Args:
         section_num: 1-6，对应 6 个章节
         **kwargs: 传递给模板的变量（company, visit_target 等）
+                     可选传入 rag_context（RAG 检索结果文本）
 
     Returns:
         list[dict]: [{"role": "system", ...}, {"role": "user", ...}]
@@ -227,6 +228,11 @@ def build_section_messages(section_num: int, **kwargs) -> list[dict]:
     }
     template = template_map.get(section_num, SECTION1_SNAPSHOT)
     user_content = template.format(**kwargs)
+
+    # 追加 RAG 检索结果（如有）
+    rag_context = kwargs.get("rag_context", "")
+    if rag_context:
+        user_content += "\n\n" + rag_context
 
     return [
         {"role": "system", "content": SYSTEM_PROMPT},

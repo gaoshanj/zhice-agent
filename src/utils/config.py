@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     feishu_app_secret: str = ""
     feishu_encrypt_key: str = ""
     feishu_verification_token: str = ""
+    feishu_wiki_space_id: str = ""  # Wiki 空间 ID（Phase 2）
 
     # Azure OpenAI
     azure_openai_endpoint: str = ""
