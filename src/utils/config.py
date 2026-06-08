@@ -17,12 +17,18 @@ class Settings(BaseSettings):
     feishu_verification_token: str = ""
     feishu_wiki_space_id: str = ""  # Wiki 空间 ID（Phase 2）
 
-    # Azure OpenAI
+    # Azure AI Foundry — Chat（资源根端点）
+    # 格式：https://<resource>.services.ai.azure.com
+    # 注意：无需 /api/projects/... 后缀，SDK 自动路由到 /openai/deployments/<model>/...
     azure_openai_endpoint: str = ""
     azure_openai_api_key: str = ""
-    azure_openai_deployment: str = "gpt-4o-2024-11-20"
-    azure_openai_api_version: str = "2024-08-01-preview"
+    azure_openai_deployment: str = "gpt-5-nano"
+    azure_openai_api_version: str = "2025-04-01-preview"
+
+    # Azure AI Foundry — Embedding（同一资源根端点，不同 api_version）
+    azure_embedding_endpoint: str = ""   # 留空则复用 azure_openai_endpoint
     azure_embedding_deployment: str = "text-embedding-3-small"
+    azure_embedding_api_version: str = "2024-06-01"
 
     # 问学系统（生产 LLM，暂时留空）
     weixue_api_base: str = ""
