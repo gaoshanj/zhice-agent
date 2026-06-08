@@ -94,11 +94,15 @@ def _refresh_user_token(refresh_token: str) -> dict:
     详见: https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/authen-v1/oidc-refresh_access_token
     """
     url = f"{BASE_URL}/authen/v1/oidc/refresh_access_token"
+    headers = {
+        "Authorization": f"Bearer {_get_app_access_token()}",
+        "Content-Type": "application/json; charset=utf-8",
+    }
     payload = {
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
     }
-    resp = httpx.post(url, json=payload, timeout=10)
+    resp = httpx.post(url, json=payload, headers=headers, timeout=10)
     data = resp.json()
 
     if data.get("code") != 0:
@@ -116,6 +120,29 @@ def _refresh_user_token(refresh_token: str) -> dict:
     return new_data
 
 
+def _get_app_access_token() -> str:
+    """获取 app_access_token（用于 OAuth token 交换时的应用认证）"""
+    token = getattr(_get_app_access_token, "_token", None)
+    expire_at = getattr(_get_app_access_token, "_expire_at", 0)
+    now = time.time()
+    if token and now < expire_at - 60:
+        return token
+
+    url = f"{BASE_URL}/auth/v3/app_access_token/internal"
+    payload = {
+        "app_id": settings.feishu_app_id,
+        "app_secret": settings.feishu_app_secret,
+    }
+    resp = httpx.post(url, json=payload, timeout=10)
+    data = resp.json()
+    if data.get("code") != 0:
+        raise RuntimeError(f"获取 app_access_token 失败: {data.get('msg', data)}")
+    token = data["app_access_token"]
+    _get_app_access_token._token = token
+    _get_app_access_token._expire_at = now + data.get("expire", 7200)
+    return token
+
+
 def init_user_token_from_code(code: str) -> str:
     """首次授权：用 authorization code 换取 token
 
@@ -127,12 +154,19 @@ def init_user_token_from_code(code: str) -> str:
     Returns:
         refresh_token（用户需要保存到环境变量）
     """
+    # 获取 app_access_token 用于 API 认证
+    app_token = _get_app_access_token()
+
     url = f"{BASE_URL}/authen/v1/oidc/access_token"
+    headers = {
+        "Authorization": f"Bearer {app_token}",
+        "Content-Type": "application/json; charset=utf-8",
+    }
     payload = {
         "grant_type": "authorization_code",
         "code": code,
     }
-    resp = httpx.post(url, json=payload, timeout=10)
+    resp = httpx.post(url, json=payload, headers=headers, timeout=10)
     data = resp.json()
 
     if data.get("code") != 0:
