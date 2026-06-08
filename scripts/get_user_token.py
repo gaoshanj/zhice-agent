@@ -38,11 +38,12 @@ redirect_uri = settings.feishu_oauth_redirect_uri  # "http://localhost:8765/oaut
 state = secrets.token_hex(16)
 server_port = 8765
 
-# 构建飞书授权 URL
+# 构建飞书授权 URL（必须包含 Wiki 权限 scope）
 params = {
     "app_id": app_id,
     "redirect_uri": redirect_uri,
     "state": state,
+    "scope": "wiki:wiki wiki:wiki:readonly wiki:space:read",
 }
 auth_url = (
     "https://open.feishu.cn/open-apis/authen/v1/authorize?"
