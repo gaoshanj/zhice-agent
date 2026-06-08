@@ -15,7 +15,7 @@ gpt-5-nano 推理模型特性：
 
 from __future__ import annotations
 
-from openai import AsyncAzureOpenAI
+from openai import AsyncAzureOpenAI, AzureOpenAI
 from src.utils.config import settings
 from src.utils.logger import logger
 
@@ -106,11 +106,27 @@ async def chat_completion(
         raise
 
 
-async def get_embedding(text: str) -> list[float]:
-    """获取文本向量嵌入（同资源根端点，api_version=2024-06-01）"""
-    client = get_embedding_client()
+def _get_sync_embedding_client() -> AzureOpenAI:
+    """获取 Embedding 用的同步 AzureOpenAI 客户端"""
+    endpoint = _get_endpoint(
+        settings.azure_embedding_endpoint,
+        settings.azure_openai_endpoint,
+    )
+    return AzureOpenAI(
+        azure_endpoint=endpoint,
+        api_key=settings.azure_openai_api_key,
+        api_version=settings.azure_embedding_api_version,
+    )
+
+
+def get_embedding(text: str) -> list[float]:
+    """获取文本向量嵌入（同步，供 ChromaDB 等同步调用方使用）
+
+    api_version=2024-06-01，与 chat 共用同一资源根端点。
+    """
+    client = _get_sync_embedding_client()
     try:
-        response = await client.embeddings.create(
+        response = client.embeddings.create(
             model=settings.azure_embedding_deployment,
             input=text,
         )
