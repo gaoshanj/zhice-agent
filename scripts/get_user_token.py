@@ -43,7 +43,7 @@ params = {
     "app_id": app_id,
     "redirect_uri": redirect_uri,
     "state": state,
-    "scope": "wiki:wiki wiki:wiki:readonly wiki:space:read",
+    "scope": "wiki:wiki wiki:wiki:readonly",
 }
 auth_url = (
     "https://open.feishu.cn/open-apis/authen/v1/authorize?"
