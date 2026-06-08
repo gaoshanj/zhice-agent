@@ -1,8 +1,15 @@
-"""飞书 Wiki API 封装 — Phase 2"""
+"""飞书 Wiki API 封装 — Phase 2
+
+支持两种认证方式：
+1. tenant_access_token（应用身份）— 默认，用于消息/普通 API
+2. user_access_token（用户身份）— 用于 Wiki 空间访问（绕过应用授权限制）
+
+优先级：user_access_token > tenant_access_token（对于 Wiki API）
+"""
 
 import json
 import time
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 
@@ -37,7 +44,31 @@ def _get_tenant_token() -> str:
     return token
 
 
-def _headers() -> dict:
+def _get_user_token() -> Optional[str]:
+    """获取 user_access_token（用户 OAuth 授权）"""
+    try:
+        from src.rag.feishu_oauth import get_user_access_token
+        return get_user_access_token()
+    except ImportError:
+        return None
+    except Exception as e:
+        logger.warning(f"获取用户 token 失败: {e}")
+        return None
+
+
+def _headers(wiki_api: bool = False) -> dict:
+    """构建请求头，Wiki API 优先使用用户 token
+
+    Args:
+        wiki_api: 是否为 Wiki API 调用。Wiki API 优先使用 user_access_token。
+    """
+    if wiki_api:
+        user_token = _get_user_token()
+        if user_token:
+            return {
+                "Authorization": f"Bearer {user_token}",
+                "Content-Type": "application/json; charset=utf-8",
+            }
     return {
         "Authorization": f"Bearer {_get_tenant_token()}",
         "Content-Type": "application/json; charset=utf-8",
@@ -55,7 +86,7 @@ def list_wiki_spaces(page_size: int = 20) -> list[dict]:
     """
     url = f"{BASE_URL}/wiki/v2/spaces"
     params = {"page_size": page_size}
-    resp = httpx.get(url, headers=_headers(), params=params, timeout=15)
+    resp = httpx.get(url, headers=_headers(wiki_api=True), params=params, timeout=15)
     data = resp.json()
     if data.get("code") != 0:
         logger.error(f"列出 Wiki 空间失败: {data}")
@@ -86,7 +117,7 @@ def list_wiki_nodes(space_id: str, parent_node_token: str = "") -> list[dict]:
     while True:
         if page_token:
             params["page_token"] = page_token
-        resp = httpx.get(url, headers=_headers(), params=params, timeout=15)
+        resp = httpx.get(url, headers=_headers(wiki_api=True), params=params, timeout=15)
         data = resp.json()
         if data.get("code") != 0:
             logger.error(f"列出 Wiki 节点失败: {data}")
@@ -132,7 +163,7 @@ def get_docx_blocks(document_id: str, page_size: int = 500) -> list[dict]:
     while True:
         if page_token:
             params["page_token"] = page_token
-        resp = httpx.get(url, headers=_headers(), params=params, timeout=15)
+        resp = httpx.get(url, headers=_headers(wiki_api=True), params=params, timeout=15)
         data = resp.json()
         if data.get("code") != 0:
             logger.error(f"获取文档 Block 失败 document_id={document_id}: {data}")

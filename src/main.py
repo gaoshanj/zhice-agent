@@ -36,6 +36,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"   Azure Chat: {settings.azure_openai_deployment}")
     logger.info(f"   Azure Embedding: {settings.azure_embedding_deployment}")
     logger.info(f"   Wiki Space ID: {settings.feishu_wiki_space_id or '未配置'}")
+    logger.info(f"   OAuth 用户授权: {'已配置' if settings.feishu_user_refresh_token else '未配置'}")
     logger.info(f"   ChromaDB: {settings.chroma_persist_dir}")
     logger.info("=" * 60)
     yield
@@ -78,6 +79,7 @@ async def health():
         "feishu_configured": bool(settings.feishu_app_id),
         "azure_configured": bool(settings.azure_openai_endpoint),
         "wiki_configured": bool(settings.feishu_wiki_space_id),
+        "oauth_configured": bool(settings.feishu_user_refresh_token),
         "embedding_configured": bool(settings.azure_embedding_deployment),
         "chroma_docs": _chroma_status(),
     }
@@ -141,6 +143,34 @@ async def _run_rebuild(space_id: str):
     except BaseException as e:
         elapsed = time.time() - start
         logger.error(f"❌ 定时索引重建失败（耗时 {elapsed:.1f}s）: {e}", exc_info=True)
+
+
+# ─── OAuth 授权端点 ──────────────────────────────────────────
+
+
+@app.get("/oauth/callback", tags=["OAuth"])
+async def oauth_callback(
+    code: str = Query(..., description="飞书返回的 authorization code"),
+    state: str = Query("", description="防 CSRF 的 state 参数"),
+):
+    """飞书 OAuth 回调端点（备用）
+
+    通常是本地脚本接收回调。此端点作为备选方案，
+    当 redirect_uri 配置为 Azure 地址时使用。
+    """
+    try:
+        from src.rag.feishu_oauth import init_user_token_from_code
+        refresh_token = init_user_token_from_code(code)
+        logger.info("OAuth 回调：用户授权成功")
+        return {
+            "status": "ok",
+            "message": "授权成功！请将 refresh_token 配置到 Azure 环境变量 FEISHU_USER_REFRESH_TOKEN",
+            "refresh_token": refresh_token,
+            "hint": "复制上面的 refresh_token，在 Azure Portal → App Service → Environment variables 中添加",
+        }
+    except Exception as e:
+        logger.error(f"OAuth 回调失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ── 命令行入口 ─────────────────────────────────────────────────

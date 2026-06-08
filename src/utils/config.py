@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     app_port: int = 8080
     log_level: str = "INFO"
 
+    # 飞书 OAuth 用户授权（用于以用户身份读取 Wiki）
+    feishu_user_refresh_token: str = ""  # 从本地授权脚本获取
+    feishu_oauth_redirect_uri: str = "http://localhost:8765/oauth/callback"
+
     # 管理接口（定时重建索引等）
     rebuild_index_secret: str = ""  # 用于保护 /admin/rebuild-index
 
