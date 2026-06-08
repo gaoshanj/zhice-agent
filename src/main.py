@@ -13,6 +13,7 @@ import dotenv
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from src.bot.feishu_handler import router as feishu_router
 from src.utils.config import settings
@@ -116,7 +117,10 @@ async def rebuild_index(secret: str = Query(..., description="验证密钥")):
         # 在后台执行（不阻塞响应），返回 202 Accepted
         import asyncio
         asyncio.create_task(_run_rebuild(space_id))
-        return {"status": "accepted", "message": f"开始重建索引，空间: {space_id}"}
+        return JSONResponse(
+            status_code=202,
+            content={"status": "accepted", "message": f"开始重建索引，空间: {space_id}"},
+        )
 
     except Exception as e:
         logger.error(f"重建索引启动失败: {e}", exc_info=True)

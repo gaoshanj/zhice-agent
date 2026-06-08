@@ -19,7 +19,7 @@ jobs:
           echo "HTTP Status: $HTTP_CODE"
           cat /tmp/reindex_response.json
 
-          if [ "$HTTP_CODE" != "202" ]; then
+          if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "202" ]; then
             echo "❌ Reindex failed with HTTP $HTTP_CODE"
             exit 1
           fi
