@@ -1,7 +1,11 @@
 """培训智策 Agent — Phase 2 主入口"""
 
-import os
+# ── ChromaDB SQLite 兼容性修复（Azure App Service 系统 sqlite3 过旧）──
+__import__("pysqlite3")
 import sys
+sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+
+import os
 from contextlib import asynccontextmanager
 from typing import Optional
 

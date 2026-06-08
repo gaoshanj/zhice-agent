@@ -36,6 +36,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 load_dotenv(".env", override=False)
 
+# ── ChromaDB SQLite 兼容性修复（Azure App Service 系统 sqlite3 过旧）──
+__import__("pysqlite3")
+import sys as _sys
+_sys.modules["sqlite3"] = _sys.modules.pop("pysqlite3")
+
 from src.rag.feishu_wiki import fetch_all_wiki_documents, list_wiki_spaces
 from src.rag.document_loader import split_documents
 from src.rag.vector_store import add_chunks, clear_collection, collection_count
