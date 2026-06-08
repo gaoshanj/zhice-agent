@@ -134,9 +134,14 @@ def similarity_search(
         logger.error(f"查询 embedding 失败: {e}")
         return []
 
+    count = coll.count()
+    if count == 0:
+        logger.warning(f"集合 {name} 为空，跳过检索")
+        return []
+
     results = coll.query(
         query_embeddings=[query_emb],
-        n_results=min(top_k, coll.count()),
+        n_results=min(top_k, count),
         where=filter_dict,
         include=["documents", "metadatas", "distances"],
     )

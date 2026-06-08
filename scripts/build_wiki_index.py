@@ -59,16 +59,14 @@ def build_index(space_id: str, rebuild: bool = False) -> None:
     logger.info(f"开始拉取 Wiki 空间：{space_id}")
     documents = fetch_all_wiki_documents(space_id)
     if not documents:
-        logger.error("未拉取到任何文档，请检查 space_id 和飞书应用权限")
-        sys.exit(1)
+        raise RuntimeError("未拉取到任何文档，请检查 space_id 和飞书应用权限")
     logger.info(f"拉取完成：{len(documents)} 篇文档")
 
     # 2. 分块
     logger.info("开始文本分块...")
     chunks = split_documents(documents, chunk_size=800, chunk_overlap=150)
     if not chunks:
-        logger.error("分块结果为空")
-        sys.exit(1)
+        raise RuntimeError("分块结果为空")
     logger.info(f"分块完成：{len(chunks)} 个 chunk")
 
     # 3. 写入向量库

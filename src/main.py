@@ -130,11 +130,17 @@ async def rebuild_index(secret: str = Query(..., description="验证密钥")):
 async def _run_rebuild(space_id: str):
     """后台异步执行索引重建"""
     from scripts.build_wiki_index import build_index
+    import time
+
+    start = time.time()
+    logger.info(f"🔄 定时索引重建开始，空间: {space_id}")
     try:
-        build_index(space_id, rebuild=False)
-        logger.info("✅ 定时索引重建完成")
-    except Exception as e:
-        logger.error(f"❌ 定时索引重建失败: {e}", exc_info=True)
+        build_index(space_id, rebuild=True)
+        elapsed = time.time() - start
+        logger.info(f"✅ 定时索引重建完成（耗时 {elapsed:.1f}s）")
+    except BaseException as e:
+        elapsed = time.time() - start
+        logger.error(f"❌ 定时索引重建失败（耗时 {elapsed:.1f}s）: {e}", exc_info=True)
 
 
 # ── 命令行入口 ─────────────────────────────────────────────────
