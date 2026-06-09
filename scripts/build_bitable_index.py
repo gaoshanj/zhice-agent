@@ -207,7 +207,7 @@ def record_to_document(rec: dict, option_map: dict) -> dict | None:
     # 需求触发时间
     trigger_time = fields.get("需求触发时间")
     if trigger_time:
-        parts.append(f"【触发时间】{resolve_value(trigger_time, "", option_map)}")
+        parts.append(f"【触发时间】{resolve_value(trigger_time, '', option_map)}")
 
     # 商机来源
     source = resolve_value(fields.get("商机来源"), "商机来源", option_map)
