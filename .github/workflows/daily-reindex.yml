@@ -26,7 +26,7 @@ jobs:
           fi
 
   reindex-bitable:
-    name: Trigger Bitable Reindex
+    name: Trigger Bitable Reindex (with polling)
     runs-on: ubuntu-latest
     steps:
       - name: Call build-bitable-index endpoint
@@ -38,8 +38,26 @@ jobs:
           cat /tmp/bitable_response.json
 
           if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "202" ]; then
-            echo "❌ Bitable index build failed with HTTP $HTTP_CODE"
+            echo "❌ Bitable endpoint rejected request (HTTP $HTTP_CODE)"
             exit 1
           fi
 
-          echo "✅ Bitable index build triggered successfully"
+          echo "✅ Build triggered (202 Accepted)"
+
+      - name: Wait for build
+        run: sleep 15
+
+      - name: Verify index built
+        run: |
+          MAX_WAIT=20
+          for i in $(seq 1 $MAX_WAIT); do
+            CHROMA_DOCS=$(curl -s "${{ secrets.APP_BASE_URL }}/health" | python3 -c "import sys,json; print(json.load(sys.stdin).get('chroma_docs', -1))" 2>/dev/null || echo "-1")
+            echo "[$i/$MAX_WAIT] chroma_docs=$CHROMA_DOCS"
+            if [ "$CHROMA_DOCS" -gt 0 ] 2>/dev/null; then
+              echo "✅ Daily Bitable reindex complete: $CHROMA_DOCS docs"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "❌ Bitable reindex failed: chroma_docs still 0 after $MAX_WAIT attempts"
+          exit 1

@@ -5,9 +5,11 @@ __import__("pysqlite3")
 import sys
 sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Any, Optional
 
 import dotenv
 import uvicorn
@@ -173,20 +175,59 @@ async def build_bitable_index(secret: str = Query(..., description="验证密钥
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ─── 索引构建状态追踪 ──────────────────────────────────────
+_bitable_build_state: dict[str, Any] = {
+    "status": "idle",  # idle | building | success | failed
+    "started_at": None,
+    "finished_at": None,
+    "error": None,
+    "doc_count": 0,
+}
+
+
 async def _run_bitable_build():
-    """后台异步执行 Bitable 索引构建"""
+    """后台异步执行 Bitable 索引构建（在线程池中运行，避免阻塞事件循环）"""
     from scripts.build_bitable_index import build_index
     import time
 
+    _bitable_build_state["status"] = "building"
+    _bitable_build_state["started_at"] = datetime.now(timezone.utc).isoformat()
+    _bitable_build_state["error"] = None
+
+    loop = asyncio.get_event_loop()
     start = time.time()
     logger.info("🔄 Bitable 索引构建开始...")
     try:
-        build_index(rebuild=True)
+        await loop.run_in_executor(None, build_index, True)
         elapsed = time.time() - start
-        logger.info(f"✅ Bitable 索引构建完成（耗时 {elapsed:.1f}s）")
+        doc_count = collection_count()
+        _bitable_build_state["status"] = "success"
+        _bitable_build_state["doc_count"] = doc_count
+        logger.info(f"✅ Bitable 索引构建完成（耗时 {elapsed:.1f}s，共 {doc_count} 条）")
     except BaseException as e:
         elapsed = time.time() - start
+        _bitable_build_state["status"] = "failed"
+        _bitable_build_state["error"] = f"{type(e).__name__}: {str(e)[:500]}"
         logger.error(f"❌ Bitable 索引构建失败（耗时 {elapsed:.1f}s）: {e}", exc_info=True)
+    finally:
+        _bitable_build_state["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+
+@app.get("/admin/bitable-status", tags=["Admin"])
+async def bitable_build_status(secret: str = Query(..., description="验证密钥")):
+    """查询 Bitable 索引构建状态 + ChromaDB 详情"""
+    if not settings.rebuild_index_secret:
+        raise HTTPException(status_code=501, detail="管理员未配置 REBUILD_INDEX_SECRET")
+    if secret != settings.rebuild_index_secret:
+        raise HTTPException(status_code=403, detail="密钥错误")
+
+    return {
+        "build_state": _bitable_build_state,
+        "chroma_docs": collection_count(),
+        "chroma_persist_dir": settings.chroma_persist_dir,
+        "embedding_configured": bool(settings.azure_embedding_deployment),
+        "bitable_configured": bool(settings.feishu_bitable_base_token),
+    }
 
 
 # ─── OAuth 授权端点 ──────────────────────────────────────────

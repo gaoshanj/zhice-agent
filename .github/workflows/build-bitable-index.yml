@@ -1,18 +1,22 @@
 name: Build Bitable Index
 
 on:
-  workflow_dispatch:  # 仅手动触发
+  workflow_dispatch:  # 手动触发
   push:
     branches: [main]
     paths:
       - "scripts/build_bitable_index.py"
+      - "src/rag/**"
+      - ".github/workflows/build-bitable-index.yml"
 
 jobs:
   build-index:
     name: Build Bitable RAG Index on Azure
     runs-on: ubuntu-latest
+
     steps:
       - name: Trigger index build on Azure
+        id: trigger
         run: |
           HTTP_CODE=$(curl -s -o /tmp/bitable_response.json -w "%{http_code}" \
             -X POST "${{ secrets.APP_BASE_URL }}/admin/build-bitable-index?secret=${{ secrets.REBUILD_INDEX_SECRET }}")
@@ -21,8 +25,55 @@ jobs:
           cat /tmp/bitable_response.json
 
           if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "202" ]; then
-            echo "❌ Bitable index build failed with HTTP $HTTP_CODE"
+            echo "❌ Endpoint rejected request (HTTP $HTTP_CODE)"
             exit 1
           fi
 
-          echo "✅ Bitable index build triggered successfully"
+          echo "✅ Build triggered (202 Accepted)"
+
+      - name: Wait for build to start
+        run: sleep 15
+
+      - name: Poll health endpoint until index built
+        run: |
+          MAX_ATTEMPTS=20
+          ATTEMPT=0
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+
+            # 调用 health 接口
+            RESPONSE=$(curl -s "${{ secrets.APP_BASE_URL }}/health")
+            CHROMA_DOCS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('chroma_docs', -1))" 2>/dev/null || echo "-1")
+
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS: chroma_docs=$CHROMA_DOCS"
+
+            if [ "$CHROMA_DOCS" -gt 0 ] 2>/dev/null; then
+              echo ""
+              echo "============================================"
+              echo "✅ Bitable 索引构建成功！"
+              echo "   知识库文档数: $CHROMA_DOCS"
+              echo "============================================"
+              exit 0
+            fi
+
+            if [ $ATTEMPT -ge $MAX_ATTEMPTS ]; then
+              break
+            fi
+
+            sleep 15
+          done
+
+          echo ""
+          echo "============================================"
+          echo "❌ 构建超时：$MAX_ATTEMPTS 次轮询后 chroma_docs 仍为 0"
+          echo ""
+          echo "最后 health 响应:"
+          echo "$RESPONSE" | python3 -m json.tool 2>/dev/null || echo "$RESPONSE"
+          echo ""
+          echo "排查建议："
+          echo "1. 查看 Azure App Service 日志（Log stream）"
+          echo "2. 确认 CHROMA_PERSIST_DIR=/home/data/chroma_data 可写"
+          echo "3. 确认 Azure Embedding deployment 配置正确"
+          echo "============================================"
+          exit 1
