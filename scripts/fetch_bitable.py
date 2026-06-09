@@ -16,8 +16,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.utils.config import settings
 
 BASE_URL = "https://open.feishu.cn/open-apis"
-BASE_TOKEN = "CeitbAhJGaHqD1s1EricZp9intf"
-TABLE_ID = "tblHp4aCxwHDJXKJ"
+BASE_TOKEN = settings.feishu_bitable_base_token
+TABLE_ID = settings.feishu_bitable_table_id
 
 
 def get_token() -> str:

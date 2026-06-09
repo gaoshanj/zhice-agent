@@ -36,6 +36,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"   Azure Chat: {settings.azure_openai_deployment}")
     logger.info(f"   Azure Embedding: {settings.azure_embedding_deployment}")
     logger.info(f"   Wiki Space ID: {settings.feishu_wiki_space_id or '未配置'}")
+    logger.info(f"   Bitable: {'已配置' if settings.feishu_bitable_base_token else '未配置'}")
     logger.info(f"   OAuth 用户授权: {'已配置' if settings.feishu_user_refresh_token else '未配置'}")
     logger.info(f"   ChromaDB: {settings.chroma_persist_dir}")
     logger.info("=" * 60)
@@ -79,6 +80,7 @@ async def health():
         "feishu_configured": bool(settings.feishu_app_id),
         "azure_configured": bool(settings.azure_openai_endpoint),
         "wiki_configured": bool(settings.feishu_wiki_space_id),
+        "bitable_configured": bool(settings.feishu_bitable_base_token),
         "oauth_configured": bool(settings.feishu_user_refresh_token),
         "embedding_configured": bool(settings.azure_embedding_deployment),
         "chroma_docs": _chroma_status(),
@@ -143,6 +145,48 @@ async def _run_rebuild(space_id: str):
     except BaseException as e:
         elapsed = time.time() - start
         logger.error(f"❌ 定时索引重建失败（耗时 {elapsed:.1f}s）: {e}", exc_info=True)
+
+
+@app.post("/admin/build-bitable-index", tags=["Admin"])
+async def build_bitable_index(secret: str = Query(..., description="验证密钥")):
+    """构建 Bitable 知识库 RAG 索引（受密钥保护）
+
+    从飞书多维表格拉取客户商机数据 → 生成 embedding → 写入 ChromaDB。
+    GitHub Actions 或手动 curl 调用此端点。
+    """
+    if not settings.rebuild_index_secret:
+        raise HTTPException(status_code=501, detail="管理员未配置 REBUILD_INDEX_SECRET")
+    if secret != settings.rebuild_index_secret:
+        raise HTTPException(status_code=403, detail="密钥错误")
+
+    logger.info("📥 收到 Bitable 索引构建请求")
+
+    try:
+        import asyncio
+        asyncio.create_task(_run_bitable_build())
+        return JSONResponse(
+            status_code=202,
+            content={"status": "accepted", "message": "开始构建 Bitable 索引"},
+        )
+    except Exception as e:
+        logger.error(f"Bitable 索引构建启动失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _run_bitable_build():
+    """后台异步执行 Bitable 索引构建"""
+    from scripts.build_bitable_index import build_index
+    import time
+
+    start = time.time()
+    logger.info("🔄 Bitable 索引构建开始...")
+    try:
+        build_index(rebuild=True)
+        elapsed = time.time() - start
+        logger.info(f"✅ Bitable 索引构建完成（耗时 {elapsed:.1f}s）")
+    except BaseException as e:
+        elapsed = time.time() - start
+        logger.error(f"❌ Bitable 索引构建失败（耗时 {elapsed:.1f}s）: {e}", exc_info=True)
 
 
 # ─── OAuth 授权端点 ──────────────────────────────────────────

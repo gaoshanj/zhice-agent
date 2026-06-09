@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     feishu_user_refresh_token: str = ""  # 从本地授权脚本获取
     feishu_oauth_redirect_uri: str = "http://localhost:8765/oauth/callback"
 
+    # Bitable 知识库（飞书多维表格）
+    feishu_bitable_base_token: str = "CeitbAhJGaHqD1s1EricZp9intf"  # 多维表格 base token
+    feishu_bitable_table_id: str = "tblHp4aCxwHDJXKJ"  # 表格 ID
+
     # 管理接口（定时重建索引等）
     rebuild_index_secret: str = ""  # 用于保护 /admin/rebuild-index
 

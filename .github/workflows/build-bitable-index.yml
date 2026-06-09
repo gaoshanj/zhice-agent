@@ -1,0 +1,29 @@
+name: Build Bitable Index
+
+on:
+  workflow_dispatch:  # 仅手动触发
+  push:
+    branches: [main]
+    paths:
+      - "scripts/build_bitable_index.py"
+
+jobs:
+  build-index:
+    name: Build Bitable RAG Index on Azure
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - name: Trigger index build on Azure
+        run: |
+          HTTP_CODE=$(curl -s -o /tmp/bitable_response.json -w "%{http_code}" \
+            -X POST "${{ secrets.APP_BASE_URL }}/admin/build-bitable-index?secret=${{ secrets.REBUILD_INDEX_SECRET }}")
+
+          echo "HTTP Status: $HTTP_CODE"
+          cat /tmp/bitable_response.json
+
+          if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "202" ]; then
+            echo "❌ Bitable index build failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+          echo "✅ Bitable index build triggered successfully"

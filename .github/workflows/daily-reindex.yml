@@ -1,4 +1,4 @@
-name: Daily Wiki Reindex
+name: Daily Reindex (Wiki + Bitable)
 
 on:
   schedule:
@@ -7,7 +7,7 @@ on:
   workflow_dispatch:  # 允许手动触发
 
 jobs:
-  reindex:
+  reindex-wiki:
     name: Trigger Wiki Reindex
     runs-on: ubuntu-latest
     steps:
@@ -20,8 +20,26 @@ jobs:
           cat /tmp/reindex_response.json
 
           if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "202" ]; then
-            echo "❌ Reindex failed with HTTP $HTTP_CODE"
+            echo "⚠️ Wiki reindex failed with HTTP $HTTP_CODE (may not be configured)"
+          else
+            echo "✅ Wiki reindex triggered successfully"
+          fi
+
+  reindex-bitable:
+    name: Trigger Bitable Reindex
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call build-bitable-index endpoint
+        run: |
+          HTTP_CODE=$(curl -s -o /tmp/bitable_response.json -w "%{http_code}" \
+            -X POST "${{ secrets.APP_BASE_URL }}/admin/build-bitable-index?secret=${{ secrets.REBUILD_INDEX_SECRET }}")
+
+          echo "HTTP Status: $HTTP_CODE"
+          cat /tmp/bitable_response.json
+
+          if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "202" ]; then
+            echo "❌ Bitable index build failed with HTTP $HTTP_CODE"
             exit 1
           fi
 
-          echo "✅ Reindex triggered successfully"
+          echo "✅ Bitable index build triggered successfully"

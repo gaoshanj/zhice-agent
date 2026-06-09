@@ -39,8 +39,9 @@ from src.utils.config import settings
 from src.utils.logger import logger
 
 BASE_URL = "https://open.feishu.cn/open-apis"
-BASE_TOKEN = "CeitbAhJGaHqD1s1EricZp9intf"
-TABLE_ID = "tblHp4aCxwHDJXKJ"
+# BASE_TOKEN / TABLE_ID 从 settings 读取，支持环境变量覆盖
+BASE_TOKEN = settings.feishu_bitable_base_token
+TABLE_ID = settings.feishu_bitable_table_id
 
 
 def get_app_token() -> str:
