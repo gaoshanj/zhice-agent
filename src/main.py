@@ -86,6 +86,8 @@ async def health():
         "oauth_configured": bool(settings.feishu_user_refresh_token),
         "embedding_configured": bool(settings.azure_embedding_deployment),
         "chroma_docs": _chroma_status(),
+        "chroma_persist_dir": settings.chroma_persist_dir,
+        "bitable_build_state": _bitable_build_state.get("status"),
     }
 
 
@@ -193,10 +195,14 @@ async def _run_bitable_build():
     _bitable_build_state["status"] = "building"
     _bitable_build_state["started_at"] = datetime.now(timezone.utc).isoformat()
     _bitable_build_state["error"] = None
+    _bitable_build_state["doc_count"] = 0
 
     loop = asyncio.get_event_loop()
     start = time.time()
     logger.info("🔄 Bitable 索引构建开始...")
+    logger.info(f"   ChromaDB 持久化目录: {settings.chroma_persist_dir}")
+    logger.info(f"   Bitable Base: {settings.feishu_bitable_base_token[:8]}...")
+    logger.info(f"   Table ID: {settings.feishu_bitable_table_id}")
     try:
         await loop.run_in_executor(None, build_index, True)
         elapsed = time.time() - start
@@ -207,7 +213,7 @@ async def _run_bitable_build():
     except BaseException as e:
         elapsed = time.time() - start
         _bitable_build_state["status"] = "failed"
-        _bitable_build_state["error"] = f"{type(e).__name__}: {str(e)[:500]}"
+        _bitable_build_state["error"] = f"{type(e).__name__}: {str(e)[:800]}"
         logger.error(f"❌ Bitable 索引构建失败（耗时 {elapsed:.1f}s）: {e}", exc_info=True)
     finally:
         _bitable_build_state["finished_at"] = datetime.now(timezone.utc).isoformat()

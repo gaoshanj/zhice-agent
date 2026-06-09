@@ -32,11 +32,11 @@ jobs:
           echo "✅ Build triggered (202 Accepted)"
 
       - name: Wait for build to start
-        run: sleep 15
+        run: sleep 30
 
       - name: Poll health endpoint until index built
         run: |
-          MAX_ATTEMPTS=20
+          MAX_ATTEMPTS=30
           ATTEMPT=0
 
           while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
@@ -45,35 +45,53 @@ jobs:
             # 调用 health 接口
             RESPONSE=$(curl -s "${{ secrets.APP_BASE_URL }}/health")
             CHROMA_DOCS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('chroma_docs', -1))" 2>/dev/null || echo "-1")
+            PERSIST_DIR=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('chroma_persist_dir', 'N/A'))" 2>/dev/null || echo "N/A")
+            BUILD_STATE=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('bitable_build_state', 'N/A'))" 2>/dev/null || echo "N/A")
 
-            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS: chroma_docs=$CHROMA_DOCS"
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS: chroma_docs=$CHROMA_DOCS, persist_dir=$PERSIST_DIR, build_state=$BUILD_STATE"
 
             if [ "$CHROMA_DOCS" -gt 0 ] 2>/dev/null; then
               echo ""
               echo "============================================"
               echo "✅ Bitable 索引构建成功！"
               echo "   知识库文档数: $CHROMA_DOCS"
+              echo "   持久化目录: $PERSIST_DIR"
               echo "============================================"
               exit 0
+            fi
+
+            # 如果构建状态已经是 failed，提前退出并查询详情
+            if [ "$BUILD_STATE" = "failed" ]; then
+              echo ""
+              echo "⚠️ 构建状态标记为 failed，查询详细错误..."
+              break
             fi
 
             if [ $ATTEMPT -ge $MAX_ATTEMPTS ]; then
               break
             fi
 
-            sleep 15
+            sleep 20
           done
 
           echo ""
           echo "============================================"
-          echo "❌ 构建超时：$MAX_ATTEMPTS 次轮询后 chroma_docs 仍为 0"
+          echo "❌ 构建超时或失败"
           echo ""
           echo "最后 health 响应:"
           echo "$RESPONSE" | python3 -m json.tool 2>/dev/null || echo "$RESPONSE"
           echo ""
+
+          # 查询 bitable-status 获取详细错误
+          echo "查询 /admin/bitable-status 获取详细诊断..."
+          STATUS_RESPONSE=$(curl -s "${{ secrets.APP_BASE_URL }}/admin/bitable-status?secret=${{ secrets.REBUILD_INDEX_SECRET }}")
+          echo "$STATUS_RESPONSE" | python3 -m json.tool 2>/dev/null || echo "$STATUS_RESPONSE"
+          echo ""
+
           echo "排查建议："
-          echo "1. 查看 Azure App Service 日志（Log stream）"
-          echo "2. 确认 CHROMA_PERSIST_DIR=/home/data/chroma_data 可写"
-          echo "3. 确认 Azure Embedding deployment 配置正确"
+          echo "1. 查看 Azure App Service 日志（Log stream）——搜索 '🔄 Bitable' 或 '❌ Bitable'"
+          echo "2. 确认 CHROMA_PERSIST_DIR 环境变量已配置且 App Service 已重启"
+          echo "3. 确认 Azure Embedding deployment（text-embedding-3-small）状态正常"
+          echo "4. 确认 Bitable 表格仍对 bot 应用授权可读"
           echo "============================================"
           exit 1

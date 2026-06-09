@@ -45,19 +45,28 @@ jobs:
           echo "✅ Build triggered (202 Accepted)"
 
       - name: Wait for build
-        run: sleep 15
+        run: sleep 30
 
       - name: Verify index built
         run: |
-          MAX_WAIT=20
+          MAX_WAIT=30
           for i in $(seq 1 $MAX_WAIT); do
-            CHROMA_DOCS=$(curl -s "${{ secrets.APP_BASE_URL }}/health" | python3 -c "import sys,json; print(json.load(sys.stdin).get('chroma_docs', -1))" 2>/dev/null || echo "-1")
-            echo "[$i/$MAX_WAIT] chroma_docs=$CHROMA_DOCS"
+            RESPONSE=$(curl -s "${{ secrets.APP_BASE_URL }}/health")
+            CHROMA_DOCS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('chroma_docs', -1))" 2>/dev/null || echo "-1")
+            BUILD_STATE=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('bitable_build_state', 'N/A'))" 2>/dev/null || echo "N/A")
+            echo "[$i/$MAX_WAIT] chroma_docs=$CHROMA_DOCS, build_state=$BUILD_STATE"
             if [ "$CHROMA_DOCS" -gt 0 ] 2>/dev/null; then
               echo "✅ Daily Bitable reindex complete: $CHROMA_DOCS docs"
               exit 0
             fi
-            sleep 15
+            if [ "$BUILD_STATE" = "failed" ]; then
+              echo "⚠️ Build failed, querying details..."
+              curl -s "${{ secrets.APP_BASE_URL }}/admin/bitable-status?secret=${{ secrets.REBUILD_INDEX_SECRET }}" | python3 -m json.tool 2>/dev/null || true
+              echo "❌ Bitable reindex failed"
+              exit 1
+            fi
+            sleep 20
           done
           echo "❌ Bitable reindex failed: chroma_docs still 0 after $MAX_WAIT attempts"
+          curl -s "${{ secrets.APP_BASE_URL }}/admin/bitable-status?secret=${{ secrets.REBUILD_INDEX_SECRET }}" | python3 -m json.tool 2>/dev/null || true
           exit 1
