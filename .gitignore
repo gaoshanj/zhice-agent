@@ -66,3 +66,7 @@ Thumbs.db
 # Playwright
 playwright-report/
 test-results/
+
+# Data exports (sensitive tokens & local data)
+data/
+test_*.json

@@ -78,7 +78,7 @@ def format_rag_context(contexts: list[str], max_chars: int = 2000) -> str:
     if not contexts:
         return ""
 
-    parts: list[str] = ["【内部知识库参考内容（来自飞书 Wiki）】"]
+    parts: list[str] = ["【内部知识库参考内容（来自飞书 Bitable/Wiki）】"]
     total = 0
     for i, ctx in enumerate(contexts, 1):
         if total + len(ctx) > max_chars:
