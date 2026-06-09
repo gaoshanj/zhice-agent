@@ -13,11 +13,12 @@ from typing import Any, Optional
 
 import dotenv
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from src.bot.feishu_handler import router as feishu_router
+from src.rag.vector_store import collection_count
 from src.utils.config import settings
 from src.utils.logger import logger
 
@@ -152,7 +153,10 @@ async def _run_rebuild(space_id: str):
 
 
 @app.post("/admin/build-bitable-index", tags=["Admin"])
-async def build_bitable_index(secret: str = Query(..., description="验证密钥")):
+async def build_bitable_index(
+    secret: str = Query(..., description="验证密钥"),
+    background_tasks: BackgroundTasks = None,
+):
     """构建 Bitable 知识库 RAG 索引（受密钥保护）
 
     从飞书多维表格拉取客户商机数据 → 生成 embedding → 写入 ChromaDB。
@@ -165,16 +169,33 @@ async def build_bitable_index(secret: str = Query(..., description="验证密钥
 
     logger.info("📥 收到 Bitable 索引构建请求")
 
-    try:
-        import asyncio
-        asyncio.create_task(_run_bitable_build())
+    # 使用 BackgroundTasks 确保后台任务可靠执行
+    if background_tasks is None:
+        # fallback：直接运行（非生产推荐，仅用于调试）
+        logger.warning("⚠️ 无 BackgroundTasks，直接运行构建")
+        _bitable_build_state["status"] = "building"
+        _bitable_build_state["started_at"] = datetime.now(timezone.utc).isoformat()
+        try:
+            from scripts.build_bitable_index import build_index
+            build_index(True)
+            _bitable_build_state["status"] = "success"
+            _bitable_build_state["doc_count"] = collection_count()
+        except BaseException as e:
+            _bitable_build_state["status"] = "failed"
+            _bitable_build_state["error"] = f"{type(e).__name__}: {str(e)[:800]}"
+            logger.error(f"❌ Bitable 同步构建失败: {e}", exc_info=True)
+        finally:
+            _bitable_build_state["finished_at"] = datetime.now(timezone.utc).isoformat()
         return JSONResponse(
-            status_code=202,
-            content={"status": "accepted", "message": "开始构建 Bitable 索引"},
+            status_code=200,
+            content={"status": "done", "build_state": _bitable_build_state},
         )
-    except Exception as e:
-        logger.error(f"Bitable 索引构建启动失败: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+
+    background_tasks.add_task(_run_bitable_build)
+    return JSONResponse(
+        status_code=202,
+        content={"status": "accepted", "message": "开始构建 Bitable 索引（后台任务）"},
+    )
 
 
 # ─── 索引构建状态追踪 ──────────────────────────────────────
@@ -189,7 +210,6 @@ _bitable_build_state: dict[str, Any] = {
 
 async def _run_bitable_build():
     """后台异步执行 Bitable 索引构建（在线程池中运行，避免阻塞事件循环）"""
-    from scripts.build_bitable_index import build_index
     import time
 
     _bitable_build_state["status"] = "building"
@@ -197,12 +217,25 @@ async def _run_bitable_build():
     _bitable_build_state["error"] = None
     _bitable_build_state["doc_count"] = 0
 
-    loop = asyncio.get_event_loop()
-    start = time.time()
     logger.info("🔄 Bitable 索引构建开始...")
     logger.info(f"   ChromaDB 持久化目录: {settings.chroma_persist_dir}")
     logger.info(f"   Bitable Base: {settings.feishu_bitable_base_token[:8]}...")
     logger.info(f"   Table ID: {settings.feishu_bitable_table_id}")
+
+    # 导入脚本（可能失败，提前捕获）
+    try:
+        logger.info("   导入 build_bitable_index 脚本...")
+        from scripts.build_bitable_index import build_index
+        logger.info("   ✅ 脚本导入成功")
+    except BaseException as e:
+        _bitable_build_state["status"] = "failed"
+        _bitable_build_state["error"] = f"导入失败 {type(e).__name__}: {str(e)[:800]}"
+        _bitable_build_state["finished_at"] = datetime.now(timezone.utc).isoformat()
+        logger.error(f"❌ build_bitable_index 导入失败: {e}", exc_info=True)
+        return
+
+    loop = asyncio.get_event_loop()
+    start = time.time()
     try:
         await loop.run_in_executor(None, build_index, True)
         elapsed = time.time() - start
@@ -227,9 +260,16 @@ async def bitable_build_status(secret: str = Query(..., description="验证密�
     if secret != settings.rebuild_index_secret:
         raise HTTPException(status_code=403, detail="密钥错误")
 
+    # 安全获取 chroma_docs，避免 500
+    try:
+        doc_count = collection_count()
+    except BaseException as e:
+        doc_count = -1
+        logger.warning(f"bitable-status 获取 collection_count 失败: {e}")
+
     return {
         "build_state": _bitable_build_state,
-        "chroma_docs": collection_count(),
+        "chroma_docs": doc_count,
         "chroma_persist_dir": settings.chroma_persist_dir,
         "embedding_configured": bool(settings.azure_embedding_deployment),
         "bitable_configured": bool(settings.feishu_bitable_base_token),
