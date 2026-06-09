@@ -71,6 +71,16 @@ async def generate_report(parsed: dict[str, Any]) -> dict[str, Any]:
         label = SECTION_LABELS[section_num - 1]
         logger.info(f"生成第 {section_num} 节: {label}")
 
+        # Section 3 交叉销售暂未启用，跳过 LLM 调用
+        if section_num == 3:
+            content = "🚧 交叉销售机会分析功能暂未上线，敬请期待。"
+            key = SECTION_NAMES[section_num - 1]
+            report_data[key] = content
+            report_data["sections"][str(section_num)] = content
+            template_vars["cross_sell"] = content
+            logger.info(f"第 3 节跳过（功能未上线）")
+            continue
+
         try:
             content = await _generate_section(
                 section_num=section_num,
@@ -83,13 +93,11 @@ async def generate_report(parsed: dict[str, Any]) -> dict[str, Any]:
 
             # 将本节内容注入模板变量，供后续章节参考
             if section_num == 1:
-                template_vars["snapshot"] = _truncate(content, 300)
+                template_vars["snapshot"] = _truncate(content, 200)
             elif section_num == 2:
-                template_vars["opportunity_scan"] = _truncate(content, 300)
-            elif section_num == 3:
-                template_vars["cross_sell"] = _truncate(content, 300)
+                template_vars["opportunity_scan"] = _truncate(content, 200)
             elif section_num == 4:
-                template_vars["strategy"] = _truncate(content, 300)
+                template_vars["strategy"] = _truncate(content, 200)
 
             logger.info(f"第 {section_num} 节生成完成（{len(content)} 字）")
 
