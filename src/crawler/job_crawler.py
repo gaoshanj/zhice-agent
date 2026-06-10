@@ -117,8 +117,8 @@ class JobCrawler(BaseCrawler):
         if settings.bing_search_api_key:
             return await self._bing_api_search(company)
 
-        # 否则通过 httpx 搜索 Bing
-        query = f"{company} 招聘 site:zhipin.com OR site:lagou.com"
+        # 否则通过 httpx 搜索 Bing（用引号精确匹配公司名）
+        query = f'"{company}" 招聘 工程师 技术 (site:zhipin.com OR site:lagou.com OR site:liepin.com)'
         url = "https://cn.bing.com/search"
         params = {"q": query, "count": 20, "mkt": "zh-CN"}
         headers = {
@@ -171,7 +171,7 @@ class JobCrawler(BaseCrawler):
 
     async def _search_baidu_jobs(self, company: str) -> list[dict[str, Any]]:
         """通过百度搜索招聘信息"""
-        query = f"{company} 招聘 工程师 技术"
+        query = f'"{company}" 招聘 工程师 技术'
         url = "https://www.baidu.com/s"
         params = {"wd": query, "rn": 20}
         headers = {

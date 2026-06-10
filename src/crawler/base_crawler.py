@@ -33,7 +33,7 @@ DEFAULT_HEADERS = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
+    # 注意：不设置 Accept-Encoding，让 httpx 自动处理解压（避免手动解压乱码）
     "Connection": "keep-alive",
 }
 

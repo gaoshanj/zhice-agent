@@ -140,7 +140,8 @@ class WebCrawler(BaseCrawler):
 
     async def _bing_search_website(self, company: str) -> str | None:
         """通过 Bing 搜索页面找官网"""
-        query = f"{company} 官方网站"
+        # 用引号强制精确匹配公司名，避免单字搜索干扰
+        query = f'"{company}" 官网 OR 官方网站'
         url = "https://cn.bing.com/search"
         params = {"q": query, "mkt": "zh-CN"}
         html = await self.fetch_html(url, params=params)
@@ -164,32 +165,74 @@ class WebCrawler(BaseCrawler):
         """从搜索结果 HTML 中提取第一个官网 URL"""
         soup = BeautifulSoup(html, "lxml")
         if source == "bing":
-            results = soup.select("li.b_algo h2 a, li.b_algo .b_title a")
+            results = soup.select("li.b_algo")
         else:
-            results = soup.select("h3.t a, .result a[href]")
+            results = soup.select("div.result, div.c-container")
 
-        for a in results:
-            href = a.get("href", "")
-            if href.startswith("http") and self._looks_like_official_website(href, company):
-                return href
-            # 处理百度跳转链接
-            if "baidu.com/link" in href:
-                continue
+        company_short = company[:4].lower()
+        # 同时匹配英文公司名（如「九号公司」→ ninebot/segway）
+        company_aliases = {
+            "九号公司": ["ninebot", "segway"],
+            "联想": ["lenovo"],
+            "华为": ["huawei"],
+            "小米": ["xiaomi", "mi.com"],
+            "百度": ["baidu"],
+            "腾讯": ["tencent"],
+            "阿里": ["alibaba", "alicloud"],
+        }
+        extra_aliases = []
+        for key, aliases in company_aliases.items():
+            if key in company:
+                extra_aliases.extend(aliases)
+
+        for result in results:
+            if source == "bing":
+                a_tags = result.select("h2 a, .b_title a")
+            else:
+                a_tags = result.select("h3 a, a[href]")
+
+            for a in a_tags:
+                href = a.get("href", "")
+                text = (a.get_text(strip=True) + " " + result.get_text(separator=" ", strip=True)[:200]).lower()
+                if href.startswith("http") and self._looks_like_official_website(href, company):
+                    # 检查结果中是否提及公司名或英文别名（相关度验证）
+                    href_lower = href.lower()
+                    name_match = company_short in text or "官网" in text or "official" in text.lower()
+                    alias_match = any(alias in href_lower or alias in text for alias in extra_aliases)
+                    if name_match or alias_match:
+                        return href
+                if "baidu.com/link" in href:
+                    continue
+
+        # 如果严格匹配没找到，放宽条件取第一个官网
+        for result in results:
+            if source == "bing":
+                a_tags = result.select("h2 a, .b_title a")
+            else:
+                a_tags = result.select("h3 a, a[href]")
+            for a in a_tags:
+                href = a.get("href", "")
+                if href.startswith("http") and self._looks_like_official_website(href, company):
+                    return href
+
         return None
 
     def _looks_like_official_website(self, url: str, company: str) -> bool:
         """判断 URL 是否像官网（而非招聘/新闻/政府网站）"""
         if not url or not url.startswith("http"):
             return False
-        # 排除明显非官网的域名
+        # 排除明显非官网的域名（包含新闻媒体、聚合平台）
         exclude_domains = [
             "baidu.com", "bing.com", "google.com",
             "zhipin.com", "lagou.com", "liepin.com", "51job.com",
             "zhaopin.com", "qichacha.com", "tianyancha.com",
             "weibo.com", "weixin.qq.com", "zhihu.com",
-            "news.sina.com", "163.com/dy",
+            "news.sina.com", "163.com", "sohu.com", "ifeng.com",
+            "toutiao.com", "36kr.com", "huxiu.com", "ithome.com",
+            "cnblogs.com", "csdn.net", "jianshu.com",
             "wikipedia.org", "gov.cn",
-            "linkedin.com", "twitter.com",
+            "linkedin.com", "twitter.com", "facebook.com",
+            "mp.weixin.qq.com", "wechat.com",
         ]
         for d in exclude_domains:
             if d in url:
@@ -217,7 +260,8 @@ class WebCrawler(BaseCrawler):
             return []
 
         soup = BeautifulSoup(html, "lxml")
-        base_domain = urllib.parse.urlparse(base_url).netloc
+        base_parsed = urllib.parse.urlparse(base_url)
+        base_domain = base_parsed.netloc
         found: list[tuple[str, str]] = []
         seen_urls: set[str] = set()
 
@@ -225,19 +269,24 @@ class WebCrawler(BaseCrawler):
             href = a.get("href", "").strip()
             text = a.get_text(strip=True).lower()
 
-            # 补全相对路径
-            if href.startswith("/"):
-                href = f"{urllib.parse.urlparse(base_url).scheme}://{base_domain}{href}"
-            elif not href.startswith("http"):
+            # 跳过 javascript/空/锚点链接
+            if not href or href.startswith("javascript:") or href.startswith("#"):
                 continue
 
-            # 只取同域名的链接
-            link_domain = urllib.parse.urlparse(href).netloc
-            if link_domain != base_domain:
+            # 补全相对路径（用 urljoin，更安全）
+            if not href.startswith("http"):
+                href = urllib.parse.urljoin(base_url, href)
+
+            # 解析完整 URL
+            parsed = urllib.parse.urlparse(href)
+            link_domain = parsed.netloc
+
+            # 只取同域名或子域名的链接
+            if not (link_domain == base_domain or link_domain.endswith("." + base_domain)):
                 continue
 
             # 判断是否为有价值的页面
-            path = urllib.parse.urlparse(href).path.lower()
+            path = parsed.path.lower()
             label = self._categorize_link(path, text)
             if label and href not in seen_urls:
                 seen_urls.add(href)
