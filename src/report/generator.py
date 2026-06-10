@@ -1,4 +1,4 @@
-"""报告生成主逻辑 — Phase 2（RAG 接入飞书 Wiki）"""
+"""报告生成主逻辑 — Phase 3（外部爬虫 + 内部 RAG 双源检索）"""
 
 from __future__ import annotations
 
@@ -35,7 +35,8 @@ SECTION_LABELS = [
 async def generate_report(parsed: dict[str, Any]) -> dict[str, Any]:
     """生成完整的销售策略报告。
 
-    Phase 1：无 RAG，直接按模板调用 LLM 逐节生成。
+    Phase 3：外部爬虫 + 内部 RAG 双源检索。
+    流程：① 爬取公司外部数据（招聘+官网） → ② 内部+外部 RAG 检索 → ③ 逐节生成
 
     Args:
         parsed: parse_user_input() 的返回值
@@ -45,6 +46,28 @@ async def generate_report(parsed: dict[str, Any]) -> dict[str, Any]:
     """
     company = parsed.get("company", "未知客户")
     logger.info(f"开始生成报告: {company}")
+
+    # ── Phase 3：预先触发外部爬虫（异步，超时 35s，不阻塞主流程）──────
+    crawl_summary: dict[str, Any] = {}
+    try:
+        from src.crawler.crawler_dispatcher import crawl_and_store
+        logger.info(f"Phase 3: 触发外部爬虫 → {company}")
+        crawl_summary = await asyncio.wait_for(
+            crawl_and_store(company=company, timeout=35.0),
+            timeout=38.0,  # 外层兜底超时
+        )
+        if crawl_summary.get("chunks_stored", 0) > 0:
+            logger.info(
+                f"外部数据写入成功: {crawl_summary['jobs_count']} 个职位，"
+                f"官网={'找到' if crawl_summary['website_found'] else '未找到'}，"
+                f"共 {crawl_summary['chunks_stored']} chunks"
+            )
+        else:
+            logger.info("外部数据爬取完成，无新增 chunks（可能已有缓存或爬取失败）")
+    except asyncio.TimeoutError:
+        logger.warning(f"外部爬虫超时（38s），继续使用内部 RAG 生成报告")
+    except Exception as e:
+        logger.warning(f"外部爬虫异常（不影响报告生成）: {e}")
 
     # 准备模板变量
     template_vars = {

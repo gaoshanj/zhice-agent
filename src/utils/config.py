@@ -40,10 +40,16 @@ class Settings(BaseSettings):
     chroma_collection_internal: str = "internal_docs"
     chroma_collection_external: str = "external_data"
 
-    # 爬虫
-    crawler_request_delay: float = 2.0
-    crawler_max_retries: int = 3
-    crawler_data_retention_days: int = 180
+    # 爬虫（Phase 3）
+    crawler_request_delay: float = 2.0       # 请求间隔（秒）
+    crawler_max_retries: int = 3             # 最大重试次数
+    crawler_data_retention_days: int = 180   # 爬取数据缓存天数
+    crawler_timeout: int = 20                # 单次请求超时（秒）
+    crawler_job_pages: int = 3               # 招聘数据最多爬取页数
+    crawler_use_playwright: bool = False     # Azure 部署时关闭 Playwright（无 GUI）
+    # 搜索 API（可选）：使用 Bing Search API 定位官网，留空则用 httpx 直接搜索
+    bing_search_api_key: str = ""
+    bing_search_endpoint: str = "https://api.bing.microsoft.com/v7.0/search"
 
     # 服务
     app_host: str = "0.0.0.0"
