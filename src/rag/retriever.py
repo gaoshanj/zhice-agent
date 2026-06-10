@@ -24,15 +24,41 @@ def retrieve_for_report(
     section_num: int,
     top_k: int = 4,
 ) -> list[str]:
-    """为报告生成检索相关知识（内部 + 外部双集合）
+    """为报告生成检索相关知识（内部 + 外部双集合）—— 返回纯文本列表（兼容旧接口）"""
+    results = retrieve_for_report_with_meta(company, section_num, top_k)
+    return [r["content"] for r in results]
 
-    Args:
-        company: 目标客户公司名
-        section_num: 当前章节编号（1~6）
-        top_k: 每个集合返回最相似的 N 条
+
+def _build_source_url(metadata: dict[str, Any]) -> str:
+    """根据 metadata 构造来源链接"""
+    source = metadata.get("source", "")
+    if source == "bitable":
+        base_token = metadata.get("base_token", "")
+        table_id = metadata.get("table_id", "")
+        record_id = metadata.get("record_id", "")
+        if base_token and table_id:
+            # 飞书 Bitable 记录链接（含 record_id 定位到具体行）
+            url = f"https://bba12hub36.feishu.cn/base/{base_token}?table={table_id}"
+            if record_id:
+                url += f"&record={record_id}"
+            return url
+    elif source == "external":
+        url = metadata.get("url", "")
+        if url:
+            return url
+    return ""
+
+
+def retrieve_for_report_with_meta(
+    company: str,
+    section_num: int,
+    top_k: int = 4,
+) -> list[dict[str, Any]]:
+    """为报告生成检索相关知识（内部 + 外部双集合）—— 返回带元数据的结果
 
     Returns:
-        相关文本片段列表（已去重、按相关度排序）
+        [{"content": str, "metadata": dict, "distance": float,
+          "source_url": str, "source_type": str, "title": str}, ...]
     """
     topic = SECTION_QUERY_MAP.get(section_num, "")
     query = f"{company} {topic}".strip()
@@ -47,7 +73,6 @@ def retrieve_for_report(
     )
 
     # ── 外部数据检索（爬虫）──────────────────────────────────────
-    # Section 1（客户快照）和 Section 2（商机扫描）最能从外部数据获益
     external_top_k = top_k if section_num in (1, 2) else 2
     external_results: list[dict[str, Any]] = []
 
@@ -63,73 +88,110 @@ def retrieve_for_report(
     else:
         logger.debug("外部数据集合为空，跳过外部检索")
 
-    # ── 合并 + 去重 ─────────────────────────────────────────────
+    # ── 合并 + 去重 + 附加来源信息 ──────────────────────────────
     all_results = internal_results + external_results
     if not all_results:
         logger.info("RAG 检索: 无结果")
         return []
 
-    # 去重（基于内容前 50 字）
     seen: set[str] = set()
-    contexts: list[str] = []
+    output: list[dict[str, Any]] = []
     for r in all_results:
         content = r.get("content", "").strip()
         dedup_key = content[:50]
-        if dedup_key not in seen and len(content) > 30:
-            seen.add(dedup_key)
-            contexts.append(content)
+        if dedup_key in seen or len(content) <= 30:
+            continue
+        seen.add(dedup_key)
+
+        meta = r.get("metadata", {})
+        source_url = _build_source_url(meta)
+        source_type = meta.get("source", "unknown")
+        title = meta.get("title", "")
+
+        output.append({
+            "content": content,
+            "metadata": meta,
+            "distance": r.get("distance"),
+            "source_url": source_url,
+            "source_type": source_type,
+            "title": title or ("外部数据" if source_type == "external" else "Bitable 记录"),
+        })
 
     logger.info(
         f"RAG 检索完成: {len(internal_results)} 内部 + "
-        f"{len(external_results)} 外部 = {len(contexts)} 条（去重后）"
+        f"{len(external_results)} 外部 = {len(output)} 条（去重后）"
     )
-    return contexts
+    return output
 
 
 def format_rag_context(
-    contexts: list[str],
+    contexts: list[str] | list[dict[str, Any]],
     max_chars: int = 2500,
 ) -> str:
     """将检索结果格式化为 Prompt 上下文
 
     Args:
-        contexts: retrieve_for_report() 的返回值
+        contexts: retrieve_for_report() 或 retrieve_for_report_with_meta() 的返回值
         max_chars: 截断上限（避免 Prompt 过长）
 
     Returns:
-        格式化后的上下文字符串
+        格式化后的上下文字符串（含来源标记 [来源1] [来源2] 等）
     """
     if not contexts:
         return ""
 
-    # 分离内部和外部数据（通过内容前缀判断）
-    internal: list[str] = []
-    external: list[str] = []
+    # 统一转为结构化 dict（兼容旧接口传 list[str]）
+    structured: list[dict[str, Any]] = []
     for ctx in contexts:
-        if "外部数据" in ctx[:100]:
-            external.append(ctx)
+        if isinstance(ctx, dict):
+            structured.append(ctx)
         else:
-            internal.append(ctx)
+            is_external = "外部数据" in ctx[:100]
+            structured.append({
+                "content": ctx,
+                "source_type": "external" if is_external else "bitable",
+                "source_url": "",
+                "title": "",
+            })
+
+    internal = [c for c in structured if c.get("source_type") != "external"]
+    external = [c for c in structured if c.get("source_type") == "external"]
 
     parts: list[str] = []
+    source_index = 0
 
     if internal:
         parts.append("【内部知识库参考内容（来自飞书 Bitable）】")
         total = 0
         for i, ctx in enumerate(internal, 1):
-            if total + len(ctx) > max_chars * 0.7:  # 内部数据占 70%
+            content = ctx["content"]
+            if total + len(content) > max_chars * 0.7:
                 parts.append(f"...（已截断，共 {i - 1} 条）")
                 break
-            parts.append(f"■ 参考 {i}：\n{ctx}")
-            total += len(ctx)
+            source_index += 1
+            ctx["_cite_id"] = source_index
+            parts.append(f"■ 参考 {i} [来源{source_index}]：\n{content}")
+            total += len(content)
 
     if external:
         parts.append("\n【外部数据参考内容（来自互联网公开信息）】")
         total = 0
         for i, ctx in enumerate(external, 1):
-            if total + len(ctx) > max_chars * 0.3:  # 外部数据占 30%
+            content = ctx["content"]
+            if total + len(content) > max_chars * 0.3:
                 break
-            parts.append(f"■ 外部 {i}：\n{ctx}")
-            total += len(ctx)
+            source_index += 1
+            ctx["_cite_id"] = source_index
+            parts.append(f"■ 外部 {i} [来源{source_index}]：\n{content}")
+            total += len(content)
+
+    # 追加来源索引表（供 LLM 引用）
+    if any(c.get("source_url") for c in structured):
+        parts.append("\n【来源索引】")
+        for c in structured:
+            cid = c.get("_cite_id")
+            url = c.get("source_url", "")
+            if cid and url:
+                parts.append(f"[来源{cid}] {c.get('title', '记录')} — {url}")
 
     return "\n\n".join(parts)

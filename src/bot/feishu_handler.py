@@ -78,7 +78,7 @@ async def _handle_user_message(chat_id: str, msg_id: str, content: str):
         # Step 2: 发送"正在生成"提示
         await _reply_text(
             chat_id, msg_id,
-            f"✅ 已收到【{company}】的生成请求，正在调用 AI 生成报告，预计需要 1-2 分钟，请稍候..."
+            f"✅ 已收到【{company}】的生成请求，正在调用 AI 生成报告，预计需要 2-3 分钟，请稍候..."
         )
 
         # Step 3: 生成报告

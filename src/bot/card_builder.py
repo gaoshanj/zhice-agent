@@ -106,11 +106,27 @@ def build_report_card(report_data: dict[str, Any]) -> dict[str, Any]:
         elements.append(_div(f"**🚀 行动建议**\n\n{actions}"))
         elements.append(_hr())
 
+    # ── 数据来源链接 ──
+    sources = report_data.get("sources", [])
+    if sources:
+        source_lines = ["**📎 数据来源**"]
+        for i, src in enumerate(sources[:5], 1):  # 最多显示 5 条
+            title = src.get("title", "Bitable 记录")
+            url = src.get("url", "")
+            src_type = src.get("type", "bitable")
+            emoji = "🌐" if src_type == "external" else "📊"
+            if url:
+                source_lines.append(f"{emoji} [{title}]({url})")
+            else:
+                source_lines.append(f"{emoji} {title}")
+        elements.append(_div("\n".join(source_lines)))
+        elements.append(_hr())
+
     # 尾部信息
     generated_at = report_data.get("generated_at", "")
     elements.append(
         _div(
-            f"---\n🤖 由 *培训智策 Agent* 生成"
+            f"🤖 由 *培训智策 Agent* 生成"
             + (f" · {generated_at}" if generated_at else "")
         )
     )

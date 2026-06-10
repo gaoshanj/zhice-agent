@@ -47,27 +47,18 @@ async def generate_report(parsed: dict[str, Any]) -> dict[str, Any]:
     company = parsed.get("company", "未知客户")
     logger.info(f"开始生成报告: {company}")
 
-    # ── Phase 3：预先触发外部爬虫（异步，超时 35s，不阻塞主流程）──────
-    crawl_summary: dict[str, Any] = {}
+    # ── Phase 3：外部爬虫 fire-and-forget（后台触发，不等待）──────────
+    # 爬虫数据是「加分项」，不应阻塞报告生成主流程。
+    # 爬虫会在后台完成并将结果写入 ChromaDB，后续请求自动受益。
     try:
         from src.crawler.crawler_dispatcher import crawl_and_store
-        logger.info(f"Phase 3: 触发外部爬虫 → {company}")
-        crawl_summary = await asyncio.wait_for(
-            crawl_and_store(company=company, timeout=35.0),
-            timeout=38.0,  # 外层兜底超时
+        logger.info(f"Phase 3: 后台触发外部爬虫 → {company}")
+        # fire-and-forget：创建后台任务，不 await
+        asyncio.create_task(
+            _fire_crawl(company)
         )
-        if crawl_summary.get("chunks_stored", 0) > 0:
-            logger.info(
-                f"外部数据写入成功: {crawl_summary['jobs_count']} 个职位，"
-                f"官网={'找到' if crawl_summary['website_found'] else '未找到'}，"
-                f"共 {crawl_summary['chunks_stored']} chunks"
-            )
-        else:
-            logger.info("外部数据爬取完成，无新增 chunks（可能已有缓存或爬取失败）")
-    except asyncio.TimeoutError:
-        logger.warning(f"外部爬虫超时（38s），继续使用内部 RAG 生成报告")
     except Exception as e:
-        logger.warning(f"外部爬虫异常（不影响报告生成）: {e}")
+        logger.warning(f"外部爬虫后台触发异常（不影响报告生成）: {e}")
 
     # 准备模板变量
     template_vars = {
@@ -86,29 +77,24 @@ async def generate_report(parsed: dict[str, Any]) -> dict[str, Any]:
     report_data: dict[str, Any] = {
         "company": company,
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        "sections": {},  # section_num -> content
+        "sections": {},
+        "sources": [],  # RAG 来源链接列表
     }
 
-    # ── 逐节生成（section 1 不需要前置依赖）───────────────────
-    for i, section_num in enumerate([1, 2, 3, 4, 5, 6], 1):
+    t_report_start = time.monotonic()
+
+    # ── 顺序生成有依赖的章节（1→2→4）─────────────────────────
+    sequential_sections = [1, 2, 4]
+    for section_num in sequential_sections:
         label = SECTION_LABELS[section_num - 1]
         logger.info(f"生成第 {section_num} 节: {label}")
-
-        # Section 3 交叉销售暂未启用，跳过 LLM 调用
-        if section_num == 3:
-            content = "🚧 交叉销售机会分析功能暂未上线，敬请期待。"
-            key = SECTION_NAMES[section_num - 1]
-            report_data[key] = content
-            report_data["sections"][str(section_num)] = content
-            template_vars["cross_sell"] = content
-            logger.info(f"第 3 节跳过（功能未上线）")
-            continue
 
         try:
             content = await _generate_section(
                 section_num=section_num,
                 template_vars=template_vars,
                 max_retries=2,
+                max_tokens=4000,
             )
             key = SECTION_NAMES[section_num - 1]
             report_data[key] = content
@@ -122,23 +108,109 @@ async def generate_report(parsed: dict[str, Any]) -> dict[str, Any]:
             elif section_num == 4:
                 template_vars["strategy"] = _truncate(content, 200)
 
-            logger.info(f"第 {section_num} 节生成完成（{len(content)} 字）")
-
         except Exception as e:
             logger.error(f"第 {section_num} 节生成失败: {e}")
             key = SECTION_NAMES[section_num - 1]
             report_data[key] = f"[生成失败：{str(e)[:100]}]"
 
-    logger.info(f"报告生成完成: {company}，共 {len(report_data)} 节")
+    # ── Section 3 交叉销售（固定占位，不调用 LLM）──────────────
+    content = "🚧 交叉销售机会分析功能暂未上线，敬请期待。"
+    report_data["cross_sell"] = content
+    report_data["sections"]["3"] = content
+    template_vars["cross_sell"] = content
+
+    # ── 并行生成无依赖的章节（5 和 6 都只依赖 S4 的 strategy）───
+    logger.info("并行生成第 5、6 节...")
+    s5_task = asyncio.create_task(
+        _generate_section(5, template_vars, max_retries=2, max_tokens=4000)
+    )
+    s6_task = asyncio.create_task(
+        _generate_section(6, template_vars, max_retries=2, max_tokens=4000)
+    )
+
+    try:
+        s5_content = await s5_task
+        report_data["talk_script"] = s5_content
+        report_data["sections"]["5"] = s5_content
+    except Exception as e:
+        logger.error(f"第 5 节生成失败: {e}")
+        report_data["talk_script"] = f"[生成失败：{str(e)[:100]}]"
+
+    try:
+        s6_content = await s6_task
+        report_data["action_plan"] = s6_content
+        report_data["sections"]["6"] = s6_content
+    except Exception as e:
+        logger.error(f"第 6 节生成失败: {e}")
+        report_data["action_plan"] = f"[生成失败：{str(e)[:100]}]"
+
+    # ── 收集 RAG 来源（去重）──────────────────────────────────
+    report_data["sources"] = _collect_sources(company)
+
+    t_report_elapsed = time.monotonic() - t_report_start
+    logger.info(
+        f"报告生成完成: {company}，总耗时 {t_report_elapsed:.1f}s，"
+        f"共 {len([k for k in report_data if k not in ('company','generated_at','sections','sources')])} 节"
+    )
     return report_data
+
+
+def _collect_sources(company: str) -> list[dict[str, str]]:
+    """收集该公司在 RAG 中检索到的所有 Bitable 来源（去重）"""
+    from src.rag.retriever import retrieve_for_report_with_meta
+
+    seen_urls: set[str] = set()
+    sources: list[dict[str, str]] = []
+
+    # 对每一节都检索一次，收集所有来源
+    for section_num in (1, 2, 4, 5, 6):
+        try:
+            results = retrieve_for_report_with_meta(company, section_num, top_k=3)
+            for r in results:
+                url = r.get("source_url", "")
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
+                    sources.append({
+                        "title": r.get("title", "Bitable 记录"),
+                        "url": url,
+                        "type": r.get("source_type", "bitable"),
+                    })
+        except Exception:
+            continue
+
+    return sources
+
+
+async def _fire_crawl(company: str) -> None:
+    """后台执行外部爬虫（fire-and-forget，异常静默处理）"""
+    try:
+        from src.crawler.crawler_dispatcher import crawl_and_store
+        result = await asyncio.wait_for(
+            crawl_and_store(company=company, timeout=35.0),
+            timeout=38.0,
+        )
+        if result.get("chunks_stored", 0) > 0:
+            logger.info(
+                f"后台爬虫完成: {company} — "
+                f"{result['jobs_count']} 职位, "
+                f"{result['chunks_stored']} chunks"
+            )
+        else:
+            logger.info(f"后台爬虫完成: {company} — 无新增数据")
+    except asyncio.TimeoutError:
+        logger.warning(f"后台爬虫超时: {company}")
+    except Exception as e:
+        logger.warning(f"后台爬虫异常: {company} — {e}")
 
 
 async def _generate_section(
     section_num: int,
     template_vars: dict[str, Any],
     max_retries: int = 2,
+    max_tokens: int = 4000,
 ) -> str:
     """生成单个章节，带重试逻辑（Phase 2：接入 RAG）"""
+    t_start = time.monotonic()
     # RAG 检索：根据公司名 + 章节主题检索飞书 Wiki 相关知识
     from src.rag.retriever import retrieve_for_report, format_rag_context
 
@@ -159,8 +231,14 @@ async def _generate_section(
 
     for attempt in range(1, max_retries + 2):  # 首次 + max_retries 次重试
         try:
-            content = await chat_completion(messages, temperature=0.3)
+            content = await chat_completion(
+                messages,
+                temperature=0.3,
+                max_tokens=max_tokens,
+            )
             if content and len(content.strip()) > 20:
+                elapsed = time.monotonic() - t_start
+                logger.info(f"第 {section_num} 节 LLM 生成完成（{len(content)} 字，{elapsed:.1f}s）")
                 return content.strip()
             else:
                 logger.warning(f"第 {section_num} 节返回内容过短，重试 {attempt}")

@@ -375,6 +375,7 @@ def build_index(rebuild: bool = False) -> None:
                 "metadata": {
                     "title": doc["title"],
                     "source": "bitable",
+                    "base_token": base_token,
                     "table_id": table_id,
                     "customer_id": doc.get("customer_id", ""),
                     "record_id": doc.get("record_id", ""),
