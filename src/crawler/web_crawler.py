@@ -43,6 +43,29 @@ NOISE_PATTERNS = [
     r"^返回顶部$",
 ]
 
+# 公司名 → 英文别名（用于搜索优化，Bing 对英文关键词配合中文效果好）
+COMPANY_ALIASES: dict[str, list[str]] = {
+    "九号公司": ["ninebot", "segway"],
+    "联想": ["lenovo"],
+    "联想集团": ["lenovo"],
+    "华为": ["huawei"],
+    "小米": ["xiaomi"],
+    "百度": ["baidu"],
+    "腾讯": ["tencent"],
+    "阿里": ["alibaba"],
+    "阿里巴巴": ["alibaba"],
+    "字节跳动": ["bytedance", "douyin"],
+    "比亚迪": ["byd"],
+    "京东": ["jd.com"],
+    "网易": ["netease"],
+    "美团": ["meituan"],
+    "滴滴": ["didi"],
+    "携程": ["trip.com", "ctrip"],
+    "蔚来": ["nio"],
+    "小鹏": ["xpeng"],
+    "理想汽车": ["lixiang", "li-auto"],
+}
+
 
 class WebCrawler(BaseCrawler):
     """公司官网爬虫"""
@@ -139,15 +162,28 @@ class WebCrawler(BaseCrawler):
         return None
 
     async def _bing_search_website(self, company: str) -> str | None:
-        """通过 Bing 搜索页面找官网"""
-        # 用引号强制精确匹配公司名，避免单字搜索干扰
-        query = f'"{company}" 官网 OR 官方网站'
+        """通过 Bing 搜索页面找官网（多策略尝试）"""
         url = "https://cn.bing.com/search"
-        params = {"q": query, "mkt": "zh-CN"}
-        html = await self.fetch_html(url, params=params)
-        if not html:
-            return None
-        return self._extract_first_url_from_search(html, company)
+
+        # 策略1：纯中文搜索（不加引号！引号会破坏 Bing 中文分词）
+        query = f"{company} 官网"
+        html = await self.fetch_html(url, params={"q": query, "mkt": "zh-CN"})
+        if html:
+            result = self._extract_first_url_from_search(html, company)
+            if result:
+                return result
+
+        # 策略2：英文别名搜索（用于中文名不直接的国际化公司）
+        aliases = COMPANY_ALIASES.get(company, [])
+        for alias in aliases[:2]:  # 最多试2个别名
+            query = f"{alias} 官网 {company}"
+            html = await self.fetch_html(url, params={"q": query, "mkt": "zh-CN"})
+            if html:
+                result = self._extract_first_url_from_search(html, company)
+                if result:
+                    return result
+
+        return None
 
     async def _baidu_search_website(self, company: str) -> str | None:
         """通过百度搜索找官网"""
@@ -171,17 +207,8 @@ class WebCrawler(BaseCrawler):
 
         company_short = company[:4].lower()
         # 同时匹配英文公司名（如「九号公司」→ ninebot/segway）
-        company_aliases = {
-            "九号公司": ["ninebot", "segway"],
-            "联想": ["lenovo"],
-            "华为": ["huawei"],
-            "小米": ["xiaomi", "mi.com"],
-            "百度": ["baidu"],
-            "腾讯": ["tencent"],
-            "阿里": ["alibaba", "alicloud"],
-        }
         extra_aliases = []
-        for key, aliases in company_aliases.items():
+        for key, aliases in COMPANY_ALIASES.items():
             if key in company:
                 extra_aliases.extend(aliases)
 
@@ -205,6 +232,7 @@ class WebCrawler(BaseCrawler):
                     continue
 
         # 如果严格匹配没找到，放宽条件取第一个官网
+        # 但必须通过基础相关度检查：域名或标题中不含字典/百科类关键词
         for result in results:
             if source == "bing":
                 a_tags = result.select("h2 a, .b_title a")
@@ -212,27 +240,49 @@ class WebCrawler(BaseCrawler):
                 a_tags = result.select("h3 a, a[href]")
             for a in a_tags:
                 href = a.get("href", "")
+                text = (a.get_text(strip=True) + " " + result.get_text(separator=" ", strip=True)[:200]).lower()
                 if href.startswith("http") and self._looks_like_official_website(href, company):
+                    # 放宽模式下也要排除字典/百科类结果
+                    href_lower = href.lower()
+                    if any(kw in href_lower or kw in text for kw in [
+                        "字典", "词典", "成语", "汉语", "国学", "zidian", "dict", "baike",
+                        "的意思", "的解释", "的拼音", "的笔顺",
+                    ]):
+                        continue
                     return href
 
         return None
 
     def _looks_like_official_website(self, url: str, company: str) -> bool:
-        """判断 URL 是否像官网（而非招聘/新闻/政府网站）"""
+        """判断 URL 是否像官网（而非招聘/新闻/字典/百科网站）"""
         if not url or not url.startswith("http"):
             return False
-        # 排除明显非官网的域名（包含新闻媒体、聚合平台）
+        # 排除明显非官网的域名
         exclude_domains = [
+            # 搜索引擎 & 导航
             "baidu.com", "bing.com", "google.com",
+            # 招聘平台
             "zhipin.com", "lagou.com", "liepin.com", "51job.com",
-            "zhaopin.com", "qichacha.com", "tianyancha.com",
+            "zhaopin.com",
+            # 企查查/天眼查
+            "qichacha.com", "tianyancha.com",
+            # 社交媒体
             "weibo.com", "weixin.qq.com", "zhihu.com",
+            "linkedin.com", "twitter.com", "facebook.com",
+            "mp.weixin.qq.com", "wechat.com", "xiaohongshu.com",
+            "douyin.com", "kuaishou.com",
+            # 新闻媒体
             "news.sina.com", "163.com", "sohu.com", "ifeng.com",
             "toutiao.com", "36kr.com", "huxiu.com", "ithome.com",
             "cnblogs.com", "csdn.net", "jianshu.com",
-            "wikipedia.org", "gov.cn",
-            "linkedin.com", "twitter.com", "facebook.com",
-            "mp.weixin.qq.com", "wechat.com",
+            # 百科 / 字典 / 教育（易被单字搜索命中）
+            "wikipedia.org", "baike.baidu.com", "baike.sogou.com",
+            "hanyuguoxue.com", "zdic.net", "zidian.",
+            "guoxue.com", "wenxuecity.com", "gushiwen.org",
+            "dict.cn", "youdao.com", "cidian.",
+            "w3school", "runoob.com",
+            # 政府
+            "gov.cn",
         ]
         for d in exclude_domains:
             if d in url:
