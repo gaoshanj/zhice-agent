@@ -19,6 +19,7 @@ from typing import Any
 
 from src.crawler.job_crawler import JobCrawler, jobs_to_chunks
 from src.crawler.web_crawler import WebCrawler, website_info_to_chunks
+from src.crawler.bitable_writer import write_crawl_result
 from src.rag.vector_store import add_chunks, similarity_search, collection_count
 from src.utils.config import settings
 from src.utils.logger import logger
@@ -74,8 +75,10 @@ async def crawl_and_store(
             "jobs_count": int,       # 爬取到的职位数
             "website_found": bool,   # 是否找到官网
             "chunks_stored": int,    # 写入向量库的 chunk 数
+            "bitable_written": int,  # 写入飞书 Bitable 的记录数
             "elapsed": float,        # 耗时秒数
             "errors": list[str],     # 错误信息（如有）
+            "bitable_errors": list[str],  # Bitable 写入错误
         }
     """
     start = time.monotonic()
@@ -84,8 +87,10 @@ async def crawl_and_store(
         "jobs_count": 0,
         "website_found": False,
         "chunks_stored": 0,
+        "bitable_written": 0,
         "elapsed": 0.0,
         "errors": [],
+        "bitable_errors": [],
     }
 
     # 缓存检查（同进程短时间内不重复爬）
@@ -99,12 +104,18 @@ async def crawl_and_store(
 
     all_chunks: list[dict[str, Any]] = []
 
+    # 保存原始爬取结果，用于后续写入 Bitable
+    raw_jobs: list[dict[str, Any]] = []
+    raw_web_info: dict[str, Any] = {}
+
     # ── 并发运行招聘爬虫 + 官网爬虫 ──────────────────────────────
     async def run_job_crawler() -> None:
+        nonlocal raw_jobs
         try:
             crawler = JobCrawler()
             jobs = await crawler.crawl_jobs(company)
             if jobs:
+                raw_jobs = jobs
                 result["jobs_count"] = len(jobs)
                 chunks = jobs_to_chunks(company, jobs)
                 all_chunks.extend(chunks)
@@ -115,9 +126,11 @@ async def crawl_and_store(
             result["errors"].append(msg)
 
     async def run_web_crawler() -> None:
+        nonlocal raw_web_info
         try:
             crawler = WebCrawler()
             info = await crawler.crawl_company_website(company)
+            raw_web_info = info
             if info.get("website_url"):
                 result["website_found"] = True
             chunks = website_info_to_chunks(company, info)
@@ -155,6 +168,57 @@ async def crawl_and_store(
             result["errors"].append(msg)
     else:
         logger.info(f"[爬虫调度] {company} 无数据写入")
+
+    # ── 写入飞书 Bitable ─────────────────────────────────────
+    # 以 URL 为唯一键去重，避免重复抓取相同网页
+    result["bitable_written"] = 0
+    result["bitable_errors"] = []
+
+    # 官网数据写入 Bitable
+    if raw_web_info and raw_web_info.get("website_url"):
+        try:
+            outcome = await write_crawl_result(
+                company=company,
+                url=raw_web_info["website_url"],
+                summary=raw_web_info.get("summary", "")[:5000],
+                source_type="官网",
+            )
+            if outcome["written"]:
+                result["bitable_written"] += 1
+            elif outcome.get("error"):
+                result["bitable_errors"].append(f"官网写入: {outcome['error']}")
+        except Exception as e:
+            logger.warning(f"[爬虫调度] Bitable 官网写入异常: {e}")
+
+    # 招聘数据逐条写入 Bitable
+    for job in raw_jobs:
+        job_url = job.get("url", "")
+        if not job_url:
+            continue
+        try:
+            summary_parts = []
+            if job.get("title"):
+                summary_parts.append(f"职位: {job['title']}")
+            if job.get("company"):
+                summary_parts.append(f"公司: {job['company']}")
+            if job.get("description"):
+                summary_parts.append(job["description"][:3000])
+
+            outcome = await write_crawl_result(
+                company=company,
+                url=job_url,
+                summary="\n".join(summary_parts),
+                source_type="招聘",
+            )
+            if outcome["written"]:
+                result["bitable_written"] += 1
+            elif outcome.get("error"):
+                result["bitable_errors"].append(f"招聘写入({job_url[:40]}): {outcome['error']}")
+        except Exception as e:
+            logger.warning(f"[爬虫调度] Bitable 招聘写入异常: {e}")
+
+    if result["bitable_written"]:
+        logger.info(f"[爬虫调度] Bitable 写入: {result['bitable_written']} 条")
 
     result["elapsed"] = round(time.monotonic() - start, 1)
     logger.info(

@@ -200,9 +200,19 @@ class JobCrawler(BaseCrawler):
             results = soup.select("div.result, div.c-container")
 
         for result in results[:15]:
+            # 提取 URL（Bing: h2 a, 百度: h3 a）
+            url = ""
+            if source == "bing":
+                a_tag = result.select_one("h2 a, .b_title a")
+            else:
+                a_tag = result.select_one("h3 a, a[href]")
+            if a_tag:
+                url = a_tag.get("href", "")
+
             text = result.get_text(separator=" ", strip=True)
             job = self._extract_job_from_text(text, company)
             if job:
+                job["url"] = url  # 附加搜索结果的链接
                 jobs.append(job)
 
         return jobs
