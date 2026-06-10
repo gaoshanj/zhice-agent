@@ -7,6 +7,7 @@ sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
 
 import asyncio
 import os
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -191,6 +192,9 @@ async def build_bitable_index(
             content={"status": "done", "build_state": _bitable_build_state},
         )
 
+    # 将状态提前设为 building，确保健康检查立即可见
+    _bitable_build_state["status"] = "building"
+    _bitable_build_state["started_at"] = datetime.now(timezone.utc).isoformat()
     background_tasks.add_task(_run_bitable_build)
     return JSONResponse(
         status_code=202,
@@ -218,11 +222,14 @@ _batch_crawl_state: dict[str, Any] = {
 }
 
 
-async def _run_bitable_build():
-    """后台异步执行 Bitable 索引构建（在线程池中运行，避免阻塞事件循环）"""
-    import time
+def _run_bitable_build():
+    """后台同步执行 Bitable 索引构建
 
-    _bitable_build_state["status"] = "building"
+    作为 BackgroundTasks 的 sync 任务在线程池中运行，
+    避免 async/await + run_in_executor 双层调度带来的
+    启动延迟或静默失败风险。
+    """
+    # state 已在调用方设为 building，这里只更新 started_at
     _bitable_build_state["started_at"] = datetime.now(timezone.utc).isoformat()
     _bitable_build_state["error"] = None
     _bitable_build_state["doc_count"] = 0
@@ -234,9 +241,7 @@ async def _run_bitable_build():
 
     # 导入脚本（可能失败，提前捕获）
     try:
-        logger.info("   导入 build_bitable_index 脚本...")
         from scripts.build_bitable_index import build_index
-        logger.info("   ✅ 脚本导入成功")
     except BaseException as e:
         _bitable_build_state["status"] = "failed"
         _bitable_build_state["error"] = f"导入失败 {type(e).__name__}: {str(e)[:800]}"
@@ -244,10 +249,9 @@ async def _run_bitable_build():
         logger.error(f"❌ build_bitable_index 导入失败: {e}", exc_info=True)
         return
 
-    loop = asyncio.get_event_loop()
     start = time.time()
     try:
-        await loop.run_in_executor(None, build_index, True)
+        build_index(True)
         elapsed = time.time() - start
         doc_count = collection_count()
         _bitable_build_state["status"] = "success"
