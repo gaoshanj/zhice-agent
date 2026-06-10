@@ -19,6 +19,7 @@ from typing import Any
 
 from src.crawler.job_crawler import JobCrawler, jobs_to_chunks
 from src.crawler.web_crawler import WebCrawler, website_info_to_chunks
+from src.crawler.news_crawler import NewsCrawler, news_to_chunks
 from src.crawler.bitable_writer import write_crawl_result
 from src.rag.vector_store import add_chunks, similarity_search, collection_count
 from src.utils.config import settings
@@ -74,6 +75,7 @@ async def crawl_and_store(
             "company": str,
             "jobs_count": int,       # 爬取到的职位数
             "website_found": bool,   # 是否找到官网
+            "news_count": int,       # 技术新闻条数
             "chunks_stored": int,    # 写入向量库的 chunk 数
             "bitable_written": int,  # 写入飞书 Bitable 的记录数
             "elapsed": float,        # 耗时秒数
@@ -86,6 +88,7 @@ async def crawl_and_store(
         "company": company,
         "jobs_count": 0,
         "website_found": False,
+        "news_count": 0,
         "chunks_stored": 0,
         "bitable_written": 0,
         "elapsed": 0.0,
@@ -107,8 +110,9 @@ async def crawl_and_store(
     # 保存原始爬取结果，用于后续写入 Bitable
     raw_jobs: list[dict[str, Any]] = []
     raw_web_info: dict[str, Any] = {}
+    raw_news: list[dict[str, Any]] = []
 
-    # ── 并发运行招聘爬虫 + 官网爬虫 ──────────────────────────────
+    # ── 并发运行招聘爬虫 + 官网爬虫 + 新闻爬虫 ───────────────
     async def run_job_crawler() -> None:
         nonlocal raw_jobs
         try:
@@ -144,9 +148,25 @@ async def crawl_and_store(
             logger.warning(f"[爬虫调度] {msg}")
             result["errors"].append(msg)
 
+    async def run_news_crawler() -> None:
+        nonlocal raw_news
+        try:
+            crawler = NewsCrawler()
+            news_list = await crawler.crawl_tech_news(company)
+            if news_list:
+                raw_news = news_list
+                result["news_count"] = len(news_list)
+                chunks = news_to_chunks(company, news_list)
+                all_chunks.extend(chunks)
+                logger.info(f"[爬虫调度] 新闻数据: {len(news_list)} 条，{len(chunks)} 个 chunk")
+        except Exception as e:
+            msg = f"新闻爬虫失败: {e}"
+            logger.warning(f"[爬虫调度] {msg}")
+            result["errors"].append(msg)
+
     try:
         await asyncio.wait_for(
-            asyncio.gather(run_job_crawler(), run_web_crawler()),
+            asyncio.gather(run_job_crawler(), run_web_crawler(), run_news_crawler()),
             timeout=timeout,
         )
     except asyncio.TimeoutError:
@@ -174,7 +194,7 @@ async def crawl_and_store(
     result["bitable_written"] = 0
     result["bitable_errors"] = []
 
-    # 官网数据写入 Bitable
+    # 官网首页数据写入 Bitable
     if raw_web_info and raw_web_info.get("website_url"):
         try:
             outcome = await write_crawl_result(
@@ -189,6 +209,20 @@ async def crawl_and_store(
                 result["bitable_errors"].append(f"官网写入: {outcome['error']}")
         except Exception as e:
             logger.warning(f"[爬虫调度] Bitable 官网写入异常: {e}")
+
+    # About 页面完整介绍写入 Bitable（独立记录，方便 RAG 检索）
+    if raw_web_info.get("about_url") and raw_web_info.get("about_full_text"):
+        try:
+            about_outcome = await write_crawl_result(
+                company=company,
+                url=raw_web_info["about_url"],
+                summary=raw_web_info["about_full_text"][:5000],
+                source_type="官网",
+            )
+            if about_outcome["written"] and raw_web_info["about_url"] != raw_web_info["website_url"]:
+                result["bitable_written"] += 1
+        except Exception as e:
+            logger.warning(f"[爬虫调度] Bitable About写入异常: {e}")
 
     # 招聘数据逐条写入 Bitable
     for job in raw_jobs:
@@ -216,6 +250,31 @@ async def crawl_and_store(
                 result["bitable_errors"].append(f"招聘写入({job_url[:40]}): {outcome['error']}")
         except Exception as e:
             logger.warning(f"[爬虫调度] Bitable 招聘写入异常: {e}")
+
+    # 新闻数据逐条写入 Bitable
+    for news in raw_news:
+        news_url = news.get("url", "")
+        if not news_url:
+            continue
+        try:
+            summary_parts = [f"标题: {news.get('title', '')}"]
+            if news.get("summary"):
+                summary_parts.append(f"摘要: {news['summary']}")
+            if news.get("topic"):
+                summary_parts.append(f"主题: {news['topic']}")
+
+            outcome = await write_crawl_result(
+                company=company,
+                url=news_url,
+                summary="\n".join(summary_parts),
+                source_type="新闻",
+            )
+            if outcome["written"]:
+                result["bitable_written"] += 1
+            elif outcome.get("error"):
+                result["bitable_errors"].append(f"新闻写入({news_url[:40]}): {outcome['error']}")
+        except Exception as e:
+            logger.warning(f"[爬虫调度] Bitable 新闻写入异常: {e}")
 
     if result["bitable_written"]:
         logger.info(f"[爬虫调度] Bitable 写入: {result['bitable_written']} 条")

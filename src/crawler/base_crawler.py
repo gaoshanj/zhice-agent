@@ -233,3 +233,77 @@ def deduplicate_texts(texts: list[str], min_len: int = 20) -> list[str]:
             seen.add(key)
             result.append(t)
     return result
+
+
+def extract_core_company_name(full_name: str) -> str:
+    """从完整公司名中提取核心名称（用于搜索优化）
+
+    去除常见公司后缀：
+    - 有限公司、股份有限公司、集团有限公司
+    - 科技有限公司、信息技术有限公司
+    - (中国)、(北京)、(上海) 等地名括号
+
+    Examples:
+        '上海汉得信息技术股份有限公司' → '汉得信息'
+        '比亚迪股份有限公司' → '比亚迪'
+        '百济神州（北京）生物科技有限公司' → '百济神州'
+
+    Returns:
+        核心公司名（如果原名已经足够短则返回原名）
+    """
+    if not full_name:
+        return ""
+
+    name = full_name.strip()
+
+    # 移除括号内容（如：阿斯利康投资（中国）有限公司 → 阿斯利康投资）
+    name = re.sub(r'[（(][^)）]*[)）]', '', name)
+
+    # 常见后缀（按长度降序排列，优先匹配长的）
+    suffixes = [
+        # 完整后缀（先匹配长的，避免短后缀误匹配）
+        "信息技术股份有限公司", "信息技术有限公司",
+        "信息股份有限公司", "信息有限公司",
+        "科技股份有限公司", "科技有限公司", "科技有限公司",
+        "生物科技有限公司", "生物技术有限公司",
+        "制药有限公司", "制药股份有限公司",
+        "实业集团有限公司", "集团有限公司",
+        "控股集团有限公司", "控股股份有限公司",
+        "投资有限公司", "投资股份有限公司",
+        "汽车科技有限公司", "汽车股份有限公司",
+        "股份有限公司", "有限责任公司",
+        "有限公司",
+    ]
+    for suffix in suffixes:
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+
+    name = name.strip()
+
+    # 移除常见城市/省份前缀
+    city_prefixes = [
+        "上海", "北京", "深圳", "广州", "广东", "浙江", "湖北",
+        "江苏", "四川", "山东", "福建", "河南", "湖南", "河北",
+    ]
+    for prefix in city_prefixes:
+        if name.startswith(prefix) and len(name) > len(prefix) + 1:
+            name = name[len(prefix):]
+            break
+
+    name = name.strip()
+
+    # 如果名字仍然包含常见后缀模式，再次尝试去除
+    extra_suffixes = ["生物", "信息", "技术", "科技", "制药", "投资", "控股"]
+    for sfx in extra_suffixes:
+        if name.endswith(sfx) and len(name) > len(sfx) + 1 and name != sfx:
+            trimmed = name[:-len(sfx)].strip()
+            if len(trimmed) >= 2:
+                name = trimmed
+                break
+
+    name = name.strip()
+    if len(name) <= 2:
+        return full_name.split("（")[0].split("(")[0][:8]
+
+    return name

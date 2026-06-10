@@ -19,7 +19,7 @@ import hashlib
 import urllib.parse
 from typing import Any
 
-from src.crawler.base_crawler import BaseCrawler, clean_text, deduplicate_texts
+from src.crawler.base_crawler import BaseCrawler, clean_text, deduplicate_texts, extract_core_company_name
 from src.utils.config import settings
 from src.utils.logger import logger
 
@@ -113,12 +113,34 @@ class JobCrawler(BaseCrawler):
 
     async def _search_bing_jobs(self, company: str) -> list[dict[str, Any]]:
         """通过 Bing 搜索获取招聘信息"""
+        # 长公司名用核心名搜索
+        search_name = extract_core_company_name(company)
+
         # 如果有 Bing Search API Key，用 API 搜索（质量更高）
         if settings.bing_search_api_key:
-            return await self._bing_api_search(company)
+            return await self._bing_api_search(search_name)
 
         # 否则通过 httpx 搜索 Bing（不加引号！引号会破坏 Bing 中文分词）
-        query = f"{company} 招聘 工程师 技术 (site:zhipin.com OR site:lagou.com OR site:liepin.com)"
+        # 针对主流招聘平台分别搜索，覆盖面更广
+        all_jobs: list[dict[str, Any]] = []
+
+        # 平台 1：BOSS直聘 + 智联招聘 + 前程无忧
+        query1 = f"{search_name} 招聘 (site:zhipin.com OR site:zhaopin.com OR site:51job.com)"
+        jobs1 = await self._bing_search_single(query1, company)
+        all_jobs.extend(jobs1)
+
+        # 平台 2：拉勾 + 猎聘（互联网/高端职位）
+        if len(all_jobs) < 5:
+            query2 = f"{search_name} 招聘 (site:lagou.com OR site:liepin.com)"
+            jobs2 = await self._bing_search_single(query2, company)
+            all_jobs.extend(jobs2)
+
+        return all_jobs
+
+    async def _bing_search_single(
+        self, query: str, company: str
+    ) -> list[dict[str, Any]]:
+        """执行单次 Bing 搜索"""
         url = "https://cn.bing.com/search"
         params = {"q": query, "count": 20, "mkt": "zh-CN"}
         headers = {
@@ -212,7 +234,9 @@ class JobCrawler(BaseCrawler):
             text = result.get_text(separator=" ", strip=True)
             job = self._extract_job_from_text(text, company)
             if job:
-                job["url"] = url  # 附加搜索结果的链接
+                # 过滤百度跳转链接和其他推广类URL
+                if url and not self._is_promotional_url(url):
+                    job["url"] = url  # 附加搜索结果的链接
                 jobs.append(job)
 
         return jobs
@@ -278,6 +302,19 @@ class JobCrawler(BaseCrawler):
             for training in TECH_KEYWORD_MAP.get(kw.lower(), []):
                 hints.add(training)
         return list(hints)[:5]
+
+    @staticmethod
+    def _is_promotional_url(url: str) -> bool:
+        """判断是否为推广/跳转链接（百度推广、广告跳转等）"""
+        if not url:
+            return True
+        promo_patterns = [
+            "baidu.com/link", "baidu.com/s?", "/s?wd=",
+            "pos.baidu.com", "cpro.baidu.com", "e.baidu.com",
+            "doubleclick.net", "googlesyndication",
+        ]
+        url_lower = url.lower()
+        return any(p in url_lower for p in promo_patterns)
 
 
 def jobs_to_rag_document(company: str, jobs: list[dict[str, Any]]) -> str:

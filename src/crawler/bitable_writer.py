@@ -111,7 +111,7 @@ async def write_crawl_result(
     if not CRAWL_TABLE_ID:
         return {"written": False, "record_id": None, "error": "未配置 CRAWL_TABLE_ID"}
 
-    if source_type not in ("官网", "招聘"):
+    if source_type not in ("官网", "招聘", "新闻"):
         logger.warning(f"[Bitable写入] 无效的来源类型: {source_type}")
         source_type = "官网"
 

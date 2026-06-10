@@ -207,6 +207,16 @@ _bitable_build_state: dict[str, Any] = {
     "doc_count": 0,
 }
 
+# ─── 批量爬取状态追踪 ──────────────────────────────────────
+_batch_crawl_state: dict[str, Any] = {
+    "status": "idle",  # idle | running | completed | failed
+    "started_at": None,
+    "finished_at": None,
+    "error": None,
+    "progress": "",  # "5/26 家公司已处理"
+    "summary": {},
+}
+
 
 async def _run_bitable_build():
     """后台异步执行 Bitable 索引构建（在线程池中运行，避免阻塞事件循环）"""
@@ -274,6 +284,108 @@ async def bitable_build_status(secret: str = Query(..., description="验证密�
         "embedding_configured": bool(settings.azure_embedding_deployment),
         "bitable_configured": bool(settings.feishu_bitable_base_token),
     }
+
+
+# ─── OAuth 授权端点 ──────────────────────────────────────────
+
+
+@app.post("/admin/batch-crawl", tags=["Admin"])
+async def batch_crawl_all(
+    secret: str = Query(..., description="验证密钥"),
+    background_tasks: BackgroundTasks = None,
+    force: bool = Query(False, description="强制重新爬取"),
+    limit: int = Query(0, description="限制公司数（0=全部）"),
+):
+    """批量爬取全部公司数据（受密钥保护）
+
+    从飞书 Bitable 读取所有公司名 → 逐公司运行爬虫（招聘+官网+新闻）
+    → 写入 ChromaDB + Bitable。
+
+    GitHub Actions 每周定时调用，也可手动 curl。
+    """
+    if not settings.rebuild_index_secret:
+        raise HTTPException(status_code=501, detail="管理员未配置 REBUILD_INDEX_SECRET")
+    if secret != settings.rebuild_index_secret:
+        raise HTTPException(status_code=403, detail="密钥错误")
+
+    if _batch_crawl_state["status"] == "running":
+        raise HTTPException(
+            status_code=409,
+            detail=f"已有批量爬取任务运行中（进度: {_batch_crawl_state.get('progress', 'unknown')}）",
+        )
+
+    logger.info(f"📥 收到批量爬取请求 (force={force}, limit={limit})")
+
+    if background_tasks is None:
+        logger.warning("⚠️ 无 BackgroundTasks，拒绝批量爬取（需要 FastAPI BackgroundTasks）")
+        raise HTTPException(status_code=500, detail="服务器配置异常，不支持后台任务")
+
+    background_tasks.add_task(_run_batch_crawl, force, limit)
+    return JSONResponse(
+        status_code=202,
+        content={
+            "status": "accepted",
+            "message": f"批量爬取已启动（force={force}, limit={limit}）",
+            "check_status": "/admin/batch-crawl-status",
+        },
+    )
+
+
+@app.get("/admin/batch-crawl-status", tags=["Admin"])
+async def batch_crawl_status(secret: str = Query(..., description="验证密钥")):
+    """查询批量爬取任务状态"""
+    if not settings.rebuild_index_secret:
+        raise HTTPException(status_code=501, detail="管理员未配置 REBUILD_INDEX_SECRET")
+    if secret != settings.rebuild_index_secret:
+        raise HTTPException(status_code=403, detail="密钥错误")
+    return _batch_crawl_state
+
+
+async def _run_batch_crawl(force: bool, limit: int):
+    """后台异步执行批量爬取"""
+    import time
+
+    _batch_crawl_state["status"] = "running"
+    _batch_crawl_state["started_at"] = datetime.now(timezone.utc).isoformat()
+    _batch_crawl_state["error"] = None
+    _batch_crawl_state["progress"] = "正在读取公司列表..."
+    _batch_crawl_state["summary"] = {}
+
+    logger.info("🔄 批量爬取开始...")
+    try:
+        from scripts.batch_crawl_all import get_all_companies, batch_crawl
+
+        companies = get_all_companies()
+        if limit > 0:
+            companies = companies[:limit]
+
+        _batch_crawl_state["progress"] = f"读取到 {len(companies)} 家公司，开始爬取..."
+        logger.info(f"   共 {len(companies)} 家公司")
+
+        summary = await batch_crawl(
+            companies=companies,
+            force=force,
+            delay_between=3.0,  # Azure 上稍快些
+            timeout_per_company=60.0,
+        )
+
+        _batch_crawl_state["status"] = "completed"
+        _batch_crawl_state["summary"] = summary
+        _batch_crawl_state["progress"] = (
+            f"完成！{summary['success']}/{summary['total']} 成功，"
+            f"Bitable {summary['total_bitable']} 条写入"
+        )
+        elapsed = time.time() - time.monotonic() + time.monotonic()
+        logger.info(
+            f"✅ 批量爬取完成：{summary['success']}/{summary['total']} 家公司，"
+            f"耗时 {summary['elapsed_secs']:.0f}s"
+        )
+    except BaseException as e:
+        _batch_crawl_state["status"] = "failed"
+        _batch_crawl_state["error"] = f"{type(e).__name__}: {str(e)[:800]}"
+        logger.error(f"❌ 批量爬取失败: {e}", exc_info=True)
+    finally:
+        _batch_crawl_state["finished_at"] = datetime.now(timezone.utc).isoformat()
 
 
 # ─── OAuth 授权端点 ──────────────────────────────────────────

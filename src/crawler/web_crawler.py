@@ -19,17 +19,22 @@ from typing import Any
 import httpx
 from bs4 import BeautifulSoup
 
-from src.crawler.base_crawler import BaseCrawler, clean_text, truncate_text
+from src.crawler.base_crawler import BaseCrawler, clean_text, truncate_text, extract_core_company_name
 from src.utils.config import settings
 from src.utils.logger import logger
 
 
 # 可能包含重要信息的页面路径关键词
 USEFUL_PATH_KEYWORDS = [
+    # About / 公司介绍（优先级最高）
     "about", "about-us", "about_us", "关于", "简介", "公司介绍",
+    "company", "corporate", "集团介绍", "企业概况", "走进", "了解我们",
+    "overview", "profile", "who-we-are",
+    # Products / 业务
     "product", "products", "solution", "solutions", "service", "services",
-    "产品", "解决方案", "服务",
-    "news", "blog", "press", "新闻", "动态", "公告",
+    "产品", "解决方案", "服务", "业务", "业务板块",
+    # News / 动态
+    "news", "blog", "press", "新闻", "动态", "公告", "媒体中心",
 ]
 
 # 无用的 meta 标签 / 链接
@@ -82,10 +87,12 @@ class WebCrawler(BaseCrawler):
             {
                 "company": str,
                 "website_url": str,
-                "summary": str,       # 公司简介（首页提取）
-                "products": str,      # 产品/服务描述
-                "news": list[str],    # 最新动态（标题列表）
-                "raw_pages": list,    # 原始页面数据
+                "about_url": str,         # 公司介绍页面URL
+                "summary": str,           # 公司简介（首页提取）
+                "about_full_text": str,   # About页面完整文本（用于RAG）
+                "products": str,          # 产品/服务描述
+                "news": list[str],        # 最新动态（标题列表）
+                "raw_pages": list,        # 原始页面数据
             }
         """
         logger.info(f"[官网爬虫] 开始爬取: {company}")
@@ -93,8 +100,14 @@ class WebCrawler(BaseCrawler):
         # Step 1: 找到官网 URL
         website_url = await self._find_website_url(company)
         if not website_url:
+            # 尝试用核心名称重试（如「上海汉得信息技术股份有限公司」→「汉得信息」）
+            core_name = extract_core_company_name(company)
+            if core_name != company:
+                logger.info(f"[官网爬虫] 用核心名重试: {company} → {core_name}")
+                website_url = await self._find_website_url(core_name)
             logger.info(f"[官网爬虫] 未找到 {company} 的官网 URL")
-            return {"company": company, "website_url": "", "summary": "",
+            return {"company": company, "website_url": "", "about_url": "",
+                    "summary": "", "about_full_text": "",
                     "products": "", "news": [], "raw_pages": []}
 
         logger.info(f"[官网爬虫] 找到官网: {website_url}")
@@ -348,12 +361,17 @@ class WebCrawler(BaseCrawler):
         return found[:5]
 
     def _categorize_link(self, path: str, text: str) -> str | None:
-        """判断链接类型"""
-        about_kws = ["about", "关于", "简介", "公司"]
-        product_kws = ["product", "solution", "service", "产品", "解决方案", "服务"]
-        news_kws = ["news", "blog", "press", "新闻", "动态", "公告"]
+        """判断链接类型（扩展更多 About 页模式）"""
+        about_kws = [
+            "about", "关于", "简介", "公司", "集团介绍", "企业概况",
+            "走进", "了解我们", "overview", "profile", "corporate",
+            "company", "who-we-are",
+        ]
+        product_kws = ["product", "solution", "service", "产品", "解决方案", "服务", "业务"]
+        news_kws = ["news", "blog", "press", "新闻", "动态", "公告", "媒体"]
 
         combined = path + " " + text
+        # About 优先级最高（因为我们需要完整公司介绍）
         if any(k in combined for k in about_kws):
             return "about"
         if any(k in combined for k in product_kws):
@@ -368,19 +386,22 @@ class WebCrawler(BaseCrawler):
         """从多个页面数据中提取结构化公司信息"""
         homepage_text = ""
         about_text = ""
+        about_url = ""
         product_text = ""
         news_titles: list[str] = []
 
         for page in pages:
             label = page.get("label", "")
             text = page.get("text", "")
+            url = page.get("url", "")
             if not text:
                 continue
 
             if label == "homepage":
                 homepage_text = text[:2000]
             elif label == "about":
-                about_text = text[:2000]
+                about_text = text  # 不截断，保留完整
+                about_url = url
             elif label == "products":
                 product_text = text[:2000]
             elif label == "news":
@@ -399,7 +420,9 @@ class WebCrawler(BaseCrawler):
         return {
             "company": company,
             "website_url": website_url,
+            "about_url": about_url or website_url,
             "summary": summary,
+            "about_full_text": about_text[:5000],  # 最多5000字，足够RAG使用
             "products": truncate_text(product_text, 1000),
             "news": news_titles[:5],
             "raw_pages": [
@@ -456,6 +479,10 @@ def website_info_to_chunks(
     if info.get("summary"):
         summary_parts.append("公司简介：")
         summary_parts.append(info["summary"])
+        summary_parts.append("")
+    if info.get("about_full_text"):
+        summary_parts.append("公司详细介绍：")
+        summary_parts.append(info["about_full_text"][:3000])
         summary_parts.append("")
     if info.get("products"):
         summary_parts.append("产品/服务：")
