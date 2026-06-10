@@ -80,7 +80,14 @@ def get_all_companies() -> list[str]:
             break
         page_token = data.get("data", {}).get("page_token")
 
-    return companies
+    # 去重：保持顺序，用 dict 记忆
+    seen: set[str] = set()
+    unique: list[str] = []
+    for c in companies:
+        if c not in seen:
+            seen.add(c)
+            unique.append(c)
+    return unique
 
 
 async def batch_crawl(
@@ -197,7 +204,7 @@ async def main():
     parser.add_argument("--force", action="store_true", help="强制重新爬取（忽略缓存）")
     parser.add_argument("--dry-run", action="store_true", help="仅列出公司名不做爬取")
     parser.add_argument("--delay", type=float, default=5.0, help="公司间请求延迟秒数（默认5s）")
-    parser.add_argument("--timeout", type=float, default=60.0, help="每公司超时秒数（默认60s）")
+    parser.add_argument("--timeout", type=float, default=90.0, help="每公司爬虫超时秒数（默认90s，LLM验证不计入）")
     parser.add_argument("--limit", type=int, default=0, help="限制爬取公司数（0=全部）")
     args = parser.parse_args()
 
