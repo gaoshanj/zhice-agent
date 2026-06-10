@@ -8,12 +8,16 @@
     python scripts/build_bitable_index.py --rebuild
 
 环境变量：
-    FEISHU_APP_ID / FEISHU_APP_SECRET（bot 身份已授权访问表格）
+    单表模式（向后兼容）：
+        FEISHU_BITABLE_BASE_TOKEN + FEISHU_BITABLE_TABLE_ID
+    多表模式：
+        FEISHU_BITABLE_TABLES='[{"base_token":"...","table_id":"...","enabled":true}]'
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -39,9 +43,44 @@ from src.utils.config import settings
 from src.utils.logger import logger
 
 BASE_URL = "https://open.feishu.cn/open-apis"
-# BASE_TOKEN / TABLE_ID 从 settings 读取，支持环境变量覆盖
-BASE_TOKEN = settings.feishu_bitable_base_token
-TABLE_ID = settings.feishu_bitable_table_id
+
+
+# ── 工具函数 ────────────────────────────────────────────
+
+def _get_tables() -> list[dict]:
+    """获取所有需要索引的表格配置
+
+    优先读取 FEISHU_BITABLE_TABLES（JSON 数组），
+    为空时回退到旧的单表配置。
+    """
+    raw = settings.feishu_bitable_tables.strip()
+    if raw:
+        try:
+            tables = json.loads(raw)
+            if not isinstance(tables, list):
+                raise ValueError("FEISHU_BITABLE_TABLES 必须是 JSON 数组")
+            # 过滤：只保留 enabled 非 false 的
+            enabled = [t for t in tables if t.get("enabled", True) is not False]
+            if not enabled:
+                raise ValueError("FEISHU_BITABLE_TABLES 中没有启用的表格")
+            logger.info(f"多表模式：{len(enabled)} 个表格")
+            for t in enabled:
+                logger.info(f"  - {t['table_id']} (base={t['base_token'][:12]}...)")
+            return enabled
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(f"FEISHU_BITABLE_TABLES 解析失败: {e}")
+            logger.warning("回退到单表模式")
+
+    # 单表回退
+    if settings.feishu_bitable_base_token and settings.feishu_bitable_table_id:
+        logger.info("单表模式")
+        return [{
+            "base_token": settings.feishu_bitable_base_token,
+            "table_id": settings.feishu_bitable_table_id,
+        }]
+
+    raise RuntimeError("未配置任何 Bitable：请设置 FEISHU_BITABLE_TABLES 或 "
+                       "FEISHU_BITABLE_BASE_TOKEN + FEISHU_BITABLE_TABLE_ID")
 
 
 def get_app_token() -> str:
@@ -56,17 +95,17 @@ def get_app_token() -> str:
     return data["app_access_token"]
 
 
-def fetch_option_map(token: str) -> dict[str, dict[str, str]]:
+def fetch_option_map(token: str, base_token: str, table_id: str) -> dict[str, dict[str, str]]:
     """获取所有选择/多选字段的选项映射 {field_name: {option_id: label}}"""
     r = httpx.get(
-        f"{BASE_URL}/bitable/v1/apps/{BASE_TOKEN}/tables/{TABLE_ID}/fields",
+        f"{BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/fields",
         headers={"Authorization": f"Bearer {token}"},
         timeout=15,
     )
     r.raise_for_status()
     data = r.json()
     if data.get("code") != 0:
-        raise RuntimeError(f"获取字段失败: {data}")
+        raise RuntimeError(f"获取字段失败 (table={table_id}): {data}")
 
     option_map: dict[str, dict[str, str]] = {}
     for field in data["data"]["items"]:
@@ -112,7 +151,7 @@ def resolve_value(value: object, field_name: str, option_map: dict) -> str:
     return str(value)
 
 
-def fetch_records(token: str) -> list[dict]:
+def fetch_records(token: str, base_token: str, table_id: str) -> list[dict]:
     """拉取全部记录"""
     all_records = []
     page_token = None
@@ -124,7 +163,7 @@ def fetch_records(token: str) -> list[dict]:
         if page_token:
             params["page_token"] = page_token
         r = httpx.get(
-            f"{BASE_URL}/bitable/v1/apps/{BASE_TOKEN}/tables/{TABLE_ID}/records",
+            f"{BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/records",
             params=params,
             headers={"Authorization": f"Bearer {token}"},
             timeout=30,
@@ -132,17 +171,18 @@ def fetch_records(token: str) -> list[dict]:
         r.raise_for_status()
         data = r.json()
         if data.get("code") != 0:
-            raise RuntimeError(f"获取记录失败: {data}")
+            raise RuntimeError(f"获取记录失败 (table={table_id}): {data}")
         items = data["data"].get("items", [])
         all_records.extend(items)
-        logger.info(f"  第 {page} 页: {len(items)} 条 (累计 {len(all_records)})")
+        logger.info(f"    第 {page} 页: {len(items)} 条 (累计 {len(all_records)})")
         if not data["data"].get("has_more"):
             break
         page_token = data["data"].get("page_token")
     return all_records
 
 
-def record_to_document(rec: dict, option_map: dict) -> dict | None:
+def record_to_document(rec: dict, option_map: dict,
+                       base_token: str = "", table_id: str = "") -> dict | None:
     """将一条 Bitable 记录转为知识库文档"""
     fields = rec.get("fields", {})
     company = ""
@@ -266,63 +306,93 @@ def record_to_document(rec: dict, option_map: dict) -> dict | None:
         "customer_id": customer_id,
         "record_id": fields.get("编号", ""),
         "source": "bitable",
-        "url": f"https://bba12hub36.feishu.cn/base/{BASE_TOKEN}?table={TABLE_ID}",
+        "url": f"https://bba12hub36.feishu.cn/base/{base_token}?table={table_id}",
     }
 
 
+# ── 主流程 ──────────────────────────────────────────────
+
 def build_index(rebuild: bool = False) -> None:
+    """构建 Bitable 知识库索引（支持多表）"""
+    tables = _get_tables()
+
     if rebuild:
         logger.warning("Rebuild 模式：清空现有集合")
         clear_collection(settings.chroma_collection_internal)
 
     token = get_app_token()
-    logger.info("获取字段选项映射...")
-    option_map = fetch_option_map(token)
 
-    logger.info("拉取多维表格数据...")
-    records = fetch_records(token)
-    logger.info(f"拉取完成：{len(records)} 条记录")
+    total_records = 0
+    total_docs = 0
+    total_chunks = 0
 
-    # 转为文档（过滤空文档）
-    documents = []
-    skipped = 0
-    for rec in records:
-        doc = record_to_document(rec, option_map)
-        if doc:
-            documents.append(doc)
-        else:
-            skipped += 1
+    for i, table_cfg in enumerate(tables):
+        base_token = table_cfg["base_token"]
+        table_id = table_cfg["table_id"]
+        label = table_cfg.get("label", table_id[:12])
 
-    logger.info(f"有效文档：{len(documents)} 条（跳过 {skipped} 条无公司名记录）")
+        logger.info(f"\n{'='*50}")
+        logger.info(f"[{i+1}/{len(tables)}] 处理表格: {label}")
+        logger.info(f"  base_token: {base_token[:12]}..., table_id: {table_id}")
+        logger.info(f"{'='*50}")
 
-    # 分块
-    logger.info("文本分块...")
-    # 对于结构化数据，每个公司-商机记录作为一个独立 chunk
-    chunks = []
-    for doc in documents:
-        chunks.append({
-            "chunk_id": f"bitable::{doc['node_token']}",
-            "content": doc["content"],
-            "metadata": {
-                "title": doc["title"],
-                "source": "bitable",
-                "customer_id": doc.get("customer_id", ""),
-                "record_id": doc.get("record_id", ""),
-            },
-        })
+        # 获取字段映射
+        logger.info("  获取字段选项映射...")
+        option_map = fetch_option_map(token, base_token, table_id)
 
-    logger.info(f"分块完成：{len(chunks)} 个 chunk")
+        # 拉取数据
+        logger.info("  拉取表格数据...")
+        records = fetch_records(token, base_token, table_id)
+        logger.info(f"  拉取完成：{len(records)} 条记录")
+        total_records += len(records)
 
-    # 写入向量库
-    logger.info("生成 embedding 并写入向量库...")
-    start = time.time()
-    count = add_chunks(chunks, collection_name=settings.chroma_collection_internal)
-    elapsed = time.time() - start
-    logger.info(f"写入完成：{count} 条（耗时 {elapsed:.1f}s）")
+        # 转文档
+        documents = []
+        skipped = 0
+        for rec in records:
+            doc = record_to_document(rec, option_map, base_token, table_id)
+            if doc:
+                documents.append(doc)
+            else:
+                skipped += 1
 
-    # 验证
-    total = collection_count()
-    logger.info(f"集合 '{settings.chroma_collection_internal}' 当前共 {total} 条记录")
+        logger.info(f"  有效文档：{len(documents)} 条（跳过 {skipped} 条无公司名记录）")
+        total_docs += len(documents)
+
+        if not documents:
+            logger.warning(f"  表格 {label} 无有效文档，跳过")
+            continue
+
+        # 分块
+        chunks = []
+        for doc in documents:
+            chunks.append({
+                "chunk_id": f"bitable::{doc['node_token']}",
+                "content": doc["content"],
+                "metadata": {
+                    "title": doc["title"],
+                    "source": "bitable",
+                    "table_id": table_id,
+                    "customer_id": doc.get("customer_id", ""),
+                    "record_id": doc.get("record_id", ""),
+                },
+            })
+
+        # 写入向量库
+        logger.info(f"  生成 embedding 并写入向量库（{len(chunks)} chunks）...")
+        start = time.time()
+        count = add_chunks(chunks, collection_name=settings.chroma_collection_internal)
+        elapsed = time.time() - start
+        logger.info(f"  写入完成：{count} 条（耗时 {elapsed:.1f}s）")
+        total_chunks += count
+
+    # 最终验证
+    final = collection_count()
+    logger.info(f"\n{'='*50}")
+    logger.info(f"🎉 所有表格索引构建完成！")
+    logger.info(f"  总记录: {total_records} | 总文档: {total_docs} | 总 chunks: {total_chunks}")
+    logger.info(f"  集合 '{settings.chroma_collection_internal}' 当前共 {final} 条记录")
+    logger.info(f"{'='*50}")
 
 
 import uuid

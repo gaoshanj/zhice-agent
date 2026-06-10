@@ -64,6 +64,8 @@ class Settings(BaseSettings):
     feishu_bitable_base_token: str = "CeitbAhJGaHqD1s1EricZp9intf"  # 多维表格 base token
     feishu_bitable_table_id: str = "tblHp4aCxwHDJXKJ"  # 知识库表格 ID
     feishu_bitable_crawl_table_id: str = "tblnZiEhmSl6htGB"  # 爬虫数据存储表 ID
+    feishu_bitable_tables: str = ""  # 多表格配置（JSON 数组），设置后覆盖上方的单表配置
+    # 格式：[{"base_token":"...","table_id":"...","source_type":"bitable","enabled":true}]
 
     # 管理接口（定时重建索引等）
     rebuild_index_secret: str = ""  # 用于保护 /admin/rebuild-index

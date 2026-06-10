@@ -83,7 +83,7 @@ async def health():
         "feishu_configured": bool(settings.feishu_app_id),
         "azure_configured": bool(settings.azure_openai_endpoint),
         "wiki_configured": bool(settings.feishu_wiki_space_id),
-        "bitable_configured": bool(settings.feishu_bitable_base_token),
+        "bitable_configured": bool(settings.feishu_bitable_base_token or settings.feishu_bitable_tables),
         "oauth_configured": bool(settings.feishu_user_refresh_token),
         "embedding_configured": bool(settings.azure_embedding_deployment),
         "chroma_docs": _chroma_status(),
@@ -282,7 +282,7 @@ async def bitable_build_status(secret: str = Query(..., description="验证密�
         "chroma_docs": doc_count,
         "chroma_persist_dir": settings.chroma_persist_dir,
         "embedding_configured": bool(settings.azure_embedding_deployment),
-        "bitable_configured": bool(settings.feishu_bitable_base_token),
+        "bitable_configured": bool(settings.feishu_bitable_base_token or settings.feishu_bitable_tables),
     }
 
 
