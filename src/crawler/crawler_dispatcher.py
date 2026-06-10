@@ -21,6 +21,11 @@ from src.crawler.job_crawler import JobCrawler, jobs_to_chunks
 from src.crawler.web_crawler import WebCrawler, website_info_to_chunks
 from src.crawler.news_crawler import NewsCrawler, news_to_chunks
 from src.crawler.bitable_writer import write_crawl_result
+from src.crawler.llm_verifier import (
+    verify_official_website,
+    extract_jobs_batch,
+    verify_news_batch,
+)
 from src.rag.vector_store import add_chunks, similarity_search, collection_count
 from src.utils.config import settings
 from src.utils.logger import logger
@@ -42,6 +47,99 @@ def _mark_crawled(company: str) -> None:
     """标记公司已爬取"""
     key = hashlib.md5(company.encode()).hexdigest()[:8]
     _crawl_cache[key] = time.monotonic()
+
+
+async def _llm_enhance_results(
+    company: str,
+    web_info: dict[str, Any],
+    jobs: list[dict[str, Any]],
+    news_items: list[dict[str, Any]],
+    result: dict[str, Any],
+) -> None:
+    """LLM 后处理：验证 URL、提取职位、过滤新闻
+
+    就地修改 web_info / jobs / news_items 和 result。
+    LLM 不可用时静默回退，不影响原始爬取结果。
+    """
+    llm_used = False
+
+    # 1. 官网 URL 验证
+    if web_info and web_info.get("website_url"):
+        website_url = web_info["website_url"]
+        candidates = [{
+            "url": website_url,
+            "title": company,
+            "snippet": web_info.get("summary", "")[:200],
+        }]
+        verify_result = await verify_official_website(company, candidates)
+        if verify_result.get("llm_used"):
+            llm_used = True
+            if not verify_result.get("official_url"):
+                logger.info(
+                    f"[LLM验证] ❌ {website_url} 不是 {company} 的官网: "
+                    f"{verify_result.get('all_verified', [{}])[0].get('reason', '')}"
+                )
+                web_info["website_url"] = ""
+                web_info["about_url"] = ""
+                result["website_found"] = False
+            else:
+                logger.info(f"[LLM验证] ✅ 确认官网: {website_url}")
+
+    # 2. 职位信息 LLM 提取增强
+    if jobs:
+        # 收集搜索结果的标题+摘要
+        search_results = []
+        for j in jobs:
+            raw_text = j.get("raw_text", "")
+            url = j.get("url", "")
+            search_results.append({
+                "url": url,
+                "title": j.get("title", ""),
+                "snippet": raw_text,
+            })
+
+        llm_jobs = await extract_jobs_batch(company, search_results)
+        if llm_jobs:
+            llm_used = True
+            logger.info(f"[LLM验证] 职位提取: {len(llm_jobs)} 条（原始 {len(jobs)} 条）")
+            # 用 LLM 结果替换原始 jobs
+            enhanced_jobs = []
+            for lj in llm_jobs:
+                title = lj.get("title", "")
+                if not title or title in ("未知职位", "未知"):
+                    continue
+                # 尝试匹配原始 URL
+                source_url = lj.get("source_url", "")
+                enhanced_jobs.append({
+                    "title": title,
+                    "keywords": lj.get("tech_keywords", []),
+                    "salary": lj.get("salary", ""),
+                    "url": source_url,
+                    "raw_text": "",
+                    "training_hints": [],  # LLM 提取的不做培训推导
+                })
+            if enhanced_jobs:
+                jobs.clear()
+                jobs.extend(enhanced_jobs)
+                result["jobs_count"] = len(enhanced_jobs)
+
+    # 3. 新闻相关性验证
+    if news_items:
+        verified_news = await verify_news_batch(company, news_items)
+        if verified_news and any(n.get("relevant") is False for n in verified_news):
+            llm_used = True
+            relevant = [n for n in verified_news if n.get("relevant") is not False]
+            filtered_count = len(news_items) - len(relevant)
+            if filtered_count > 0:
+                logger.info(
+                    f"[LLM验证] 新闻过滤: {filtered_count} 条不相关，"
+                    f"保留 {len(relevant)} 条"
+                )
+                news_items.clear()
+                news_items.extend(relevant)
+                result["news_count"] = len(relevant)
+
+    result["llm_enhanced"] = llm_used
 
 
 def _has_external_data(company: str) -> bool:
@@ -172,6 +270,24 @@ async def crawl_and_store(
     except asyncio.TimeoutError:
         logger.warning(f"[爬虫调度] {company} 爬取超时（{timeout}s）")
         result["errors"].append(f"爬取超时（{timeout}s）")
+
+    # ── LLM 验证增强（后处理） ──────────────────────────────────
+    await _llm_enhance_results(
+        company, raw_web_info, raw_jobs, raw_news, result
+    )
+
+    # 如果有 LLM 增强后的数据，重新生成 chunks
+    if result.get("llm_enhanced"):
+        all_chunks = []
+        if raw_jobs:
+            chunks = jobs_to_chunks(company, raw_jobs)
+            all_chunks.extend(chunks)
+        if raw_web_info.get("website_url"):
+            chunks = website_info_to_chunks(company, raw_web_info)
+            all_chunks.extend(chunks)
+        if raw_news:
+            chunks = news_to_chunks(company, raw_news)
+            all_chunks.extend(chunks)
 
     # ── 写入向量库 ─────────────────────────────────────────────
     if all_chunks:
