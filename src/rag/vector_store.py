@@ -11,6 +11,7 @@ from src.utils.logger import logger
 
 import chromadb
 from chromadb.config import Settings as ChromaSettings
+from chromadb.errors import NotFoundError
 
 
 # ─── 单例客户端（进程内复用）───────────────────────────────
@@ -32,15 +33,40 @@ def _get_client() -> chromadb.Client:
 
 
 def _get_collection(name: str) -> chromadb.Collection:
-    """获取（或创建）指定名称的集合（单例缓存）"""
+    """获取（或创建）指定名称的集合（单例缓存）
+
+    对 ChromaDB persist 层不一致状态有防御：
+    - 如果 get_or_create_collection 抛出 NotFoundError（旧 UUID 残留），
+      删除同名集合后重试一次
+    """
     if name not in _collections:
         client = _get_client()
-        _collections[name] = client.get_or_create_collection(
-            name=name,
-            metadata={"hnsw:space": "cosine"},  # cosine 相似度
-        )
+        try:
+            _collections[name] = client.get_or_create_collection(
+                name=name,
+                metadata={"hnsw:space": "cosine"},
+            )
+        except NotFoundError:
+            # ChromaDB 内部状态不一致（旧 UUID 残留）
+            # 尝试删除后重新创建
+            logger.warning(f"集合 {name} 状态不一致，尝试修复...")
+            _reset_collection(client, name)
+            _collections[name] = client.get_or_create_collection(
+                name=name,
+                metadata={"hnsw:space": "cosine"},
+            )
+            logger.info(f"集合修复成功: {name}")
         logger.info(f"集合就绪: {name}（共 {_collections[name].count()} 条）")
     return _collections[name]
+
+
+def _reset_collection(client: chromadb.Client, name: str) -> None:
+    """安全重置集合（先删后建，忽略任何错误）"""
+    try:
+        client.delete_collection(name)
+    except Exception:
+        pass  # 不存在也正常
+    _collections.pop(name, None)
 
 
 # ─── 公开接口 ─────────────────────────────────────────────────
@@ -171,12 +197,12 @@ def collection_count(collection_name: str = "") -> int:
 
 
 def clear_collection(collection_name: str = "") -> None:
-    """清空指定集合（慎用）"""
+    """清空指定集合（慎用）
+
+    先删除整个集合，再通过 get_or_create_collection 重新创建空集合，
+    确保 ChromaDB 内部 UUID 引用被完全重置。
+    """
     name = collection_name or settings.chroma_collection_internal
-    try:
-        client = _get_client()
-        client.delete_collection(name)
-        _collections.pop(name, None)
-        logger.warning(f"集合已清空: {name}")
-    except Exception as e:
-        logger.error(f"清空集合失败 {name}: {e}")
+    client = _get_client()
+    _reset_collection(client, name)
+    logger.warning(f"集合已清空: {name}")

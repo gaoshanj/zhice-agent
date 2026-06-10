@@ -317,8 +317,11 @@ def build_index(rebuild: bool = False) -> None:
     tables = _get_tables()
 
     if rebuild:
-        logger.warning("Rebuild 模式：清空现有集合")
-        clear_collection(settings.chroma_collection_internal)
+        logger.warning("Rebuild 模式：清空现有集合并重建")
+        try:
+            clear_collection(settings.chroma_collection_internal)
+        except Exception as e:
+            logger.warning(f"清空集合失败（如首次构建则正常）: {e}")
 
     token = get_app_token()
 
