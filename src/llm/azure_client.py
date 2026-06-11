@@ -30,11 +30,16 @@ from src.utils.config import settings
 from src.utils.logger import logger
 
 REASONING_MODEL_TOKENS = 16000  # 默认 max_completion_tokens
+REASONING_MIN_EFFECTIVE = 10000  # 推理模型最小有效输出阈值（低于此值可能返回空内容）
 REASONING_MODELS = ("gpt-5", "o1", "o3", "o4")
 
 
 def _is_reasoning_model(model: str) -> bool:
     return any(prefix in model for prefix in REASONING_MODELS)
+
+
+# 公开别名，供外部模块（如 generator）使用
+is_reasoning_model = _is_reasoning_model
 
 
 def _get_endpoint(preferred: str, fallback: str) -> str:
@@ -82,6 +87,9 @@ async def chat_completion(
     """调用 Azure AI Foundry Chat 接口生成内容（异步）。
 
     自动适配推理模型（gpt-5-nano）的参数限制。
+    推理模型关键行为：~95% completion_tokens 用于推理，仅 ~5% 为可见输出。
+    若 max_completion_tokens 过低（如 4000），推理将耗尽所有预算，
+    导致 content 为 None/空字符串。
     """
     client = get_chat_client()
     model = settings.azure_openai_deployment
@@ -94,9 +102,16 @@ async def chat_completion(
         }
 
         if is_reasoning:
-            # 推理模型：用 max_completion_tokens，不传 temperature
-            params["max_completion_tokens"] = max_tokens or REASONING_MODEL_TOKENS
-            logger.debug(f"推理模型模式: max_completion_tokens={params['max_completion_tokens']}")
+            requested = max_tokens or REASONING_MODEL_TOKENS
+            # 推理模型需要足够的 token 预算才能产生可见输出
+            # 低于 REASONING_MIN_EFFECTIVE 时自动提升到安全值
+            if requested < REASONING_MIN_EFFECTIVE:
+                logger.info(
+                    f"推理模型: max_completion_tokens {requested} → {REASONING_MIN_EFFECTIVE} "
+                    f"(低于有效输出阈值)"
+                )
+                requested = REASONING_MIN_EFFECTIVE
+            params["max_completion_tokens"] = requested
         else:
             params["max_tokens"] = max_tokens or 2000
             if temperature is not None:
@@ -104,12 +119,22 @@ async def chat_completion(
 
         response = await client.chat.completions.create(**params)
         content = response.choices[0].message.content
+        finish_reason = response.choices[0].finish_reason
 
         usage = response.usage
         if usage:
             logger.debug(
                 f"Token: prompt={usage.prompt_tokens}, "
-                f"completion={usage.completion_tokens}"
+                f"completion={usage.completion_tokens}, "
+                f"finish_reason={finish_reason}"
+            )
+
+        # 推理模型返回空内容的常见原因：token 预算不足
+        if not content and is_reasoning:
+            logger.warning(
+                f"推理模型返回空内容！finish_reason={finish_reason}, "
+                f"completion_tokens={usage.completion_tokens if usage else 'N/A'}。"
+                f"考虑增加 max_completion_tokens。"
             )
 
         return content or ""

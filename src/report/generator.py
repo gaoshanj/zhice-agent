@@ -7,7 +7,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from src.llm.azure_client import chat_completion, classify_llm_error, is_retryable_error
+from src.llm.azure_client import chat_completion, classify_llm_error
 from src.llm.prompt_templates import build_section_messages
 from src.utils.config import settings
 from src.utils.logger import logger
@@ -214,11 +214,15 @@ async def _generate_section(
     重试策略：
       - 瞬态错误（超时/限流/连接失败）: 指数退避重试
       - 非瞬态错误（认证失败/部署不存在/参数错误）: 立即失败，不重试
+      - 推理模型空输出: 倍增加大 max_completion_tokens 后重试
     """
-    t_start = time.monotonic()
-    # RAG 检索：根据公司名 + 章节主题检索飞书 Wiki 相关知识
+    from src.llm.azure_client import (
+        chat_completion, classify_llm_error, is_reasoning_model,
+        REASONING_MIN_EFFECTIVE,
+    )
     from src.rag.retriever import retrieve_for_report, format_rag_context
 
+    t_start = time.monotonic()
     company = template_vars.get("company", "")
     contexts = retrieve_for_report(company, section_num)
     rag_context = format_rag_context(contexts)
@@ -234,6 +238,13 @@ async def _generate_section(
         **template_vars,
     )
 
+    # 推理模型自适应 token 预算
+    from src.utils.config import settings
+    is_reasoning = is_reasoning_model(settings.azure_openai_deployment)
+    effective_tokens = max_tokens
+    if is_reasoning and effective_tokens < REASONING_MIN_EFFECTIVE:
+        effective_tokens = REASONING_MIN_EFFECTIVE
+
     last_error: Exception | None = None
 
     for attempt in range(1, max_retries + 2):  # 首次 + max_retries 次重试
@@ -241,14 +252,29 @@ async def _generate_section(
             content = await chat_completion(
                 messages,
                 temperature=0.3,
-                max_tokens=max_tokens,
+                max_tokens=effective_tokens,
             )
             if content and len(content.strip()) > 20:
                 elapsed = time.monotonic() - t_start
-                logger.info(f"第 {section_num} 节 LLM 生成完成（{len(content)} 字，{elapsed:.1f}s）")
+                logger.info(
+                    f"第 {section_num} 节 LLM 生成完成"
+                    f"（{len(content)} 字，{elapsed:.1f}s）"
+                )
                 return content.strip()
+
+            # 空内容/过短：推理模型常见的 token 预算问题
+            if not content and is_reasoning:
+                old_tokens = effective_tokens
+                effective_tokens = min(effective_tokens + 6000, 20000)
+                logger.warning(
+                    f"第 {section_num} 节返回空内容，可能是推理预算不足："
+                    f"max_completion_tokens {old_tokens} → {effective_tokens}，重试..."
+                )
             else:
-                logger.warning(f"第 {section_num} 节返回内容过短，重试 {attempt}")
+                logger.warning(
+                    f"第 {section_num} 节返回内容过短 "
+                    f"({len(content) if content else 0} chars)，重试 {attempt}"
+                )
         except Exception as e:
             last_error = e
             reason, retryable = classify_llm_error(e)
@@ -257,18 +283,20 @@ async def _generate_section(
             )
 
             if not retryable:
-                # 非瞬态错误：直接抛出，不再重试浪费时间和 token
                 raise RuntimeError(f"第 {section_num} 节失败 — {reason}") from e
 
             if attempt <= max_retries:
-                backoff = min(2 * attempt, 8)  # 指数退避，上限 8 秒
+                backoff = min(2 * attempt, 8)
                 logger.info(f"第 {section_num} 节等待 {backoff}s 后重试...")
                 await asyncio.sleep(backoff)
             else:
                 break
 
     # 所有重试均失败
-    reason, _ = classify_llm_error(last_error) if last_error else ("未知错误", False)
+    if last_error:
+        reason, _ = classify_llm_error(last_error)
+    else:
+        reason = "推理模型返回空内容（token 预算可能不足）"
     raise RuntimeError(f"第 {section_num} 节失败 — {reason}（已重试 {max_retries} 次）")
 
 
