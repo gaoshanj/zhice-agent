@@ -83,13 +83,21 @@ async def chat_completion(
     messages: list[dict],
     temperature: float | None = None,
     max_tokens: int | None = None,
+    reasoning_effort: str | None = None,
 ) -> str:
     """调用 Azure AI Foundry Chat 接口生成内容（异步）。
 
     自动适配推理模型（gpt-5-nano）的参数限制。
-    推理模型关键行为：~95% completion_tokens 用于推理，仅 ~5% 为可见输出。
-    若 max_completion_tokens 过低（如 4000），推理将耗尽所有预算，
-    导致 content 为 None/空字符串。
+    推理模型关键行为（默认 reasoning_effort="high"）：~95% completion_tokens 用于推理，
+    仅 ~5% 为可见输出。设置 reasoning_effort="low" 可大幅减少推理占比，
+    配合较小的 max_completion_tokens（如 4000）即可获得完整输出。
+
+    Args:
+        messages: OpenAI 格式消息列表
+        temperature: 温度参数（推理模型忽略）
+        max_tokens: 最大输出 token 数
+        reasoning_effort: 推理强度（"low"/"medium"/"high"），仅对推理模型生效。
+                          None 表示使用模型默认值（通常为 "high"）。
     """
     client = get_chat_client()
     model = settings.azure_openai_deployment
@@ -103,15 +111,18 @@ async def chat_completion(
 
         if is_reasoning:
             requested = max_tokens or REASONING_MODEL_TOKENS
-            # 推理模型需要足够的 token 预算才能产生可见输出
-            # 低于 REASONING_MIN_EFFECTIVE 时自动提升到安全值
-            if requested < REASONING_MIN_EFFECTIVE:
-                logger.info(
-                    f"推理模型: max_completion_tokens {requested} → {REASONING_MIN_EFFECTIVE} "
-                    f"(低于有效输出阈值)"
-                )
-                requested = REASONING_MIN_EFFECTIVE
+            # 当未显式降低推理强度时，需要足够的 token 预算才能产生可见输出
+            if reasoning_effort is None or reasoning_effort == "high":
+                if requested < REASONING_MIN_EFFECTIVE:
+                    logger.info(
+                        f"推理模型: max_completion_tokens {requested} → {REASONING_MIN_EFFECTIVE} "
+                        f"(低于有效输出阈值，reasoning_effort={reasoning_effort or 'default'})"
+                    )
+                    requested = REASONING_MIN_EFFECTIVE
             params["max_completion_tokens"] = requested
+            if reasoning_effort is not None:
+                params["reasoning_effort"] = reasoning_effort
+                logger.debug(f"推理模型 reasoning_effort={reasoning_effort}")
         else:
             params["max_tokens"] = max_tokens or 2000
             if temperature is not None:

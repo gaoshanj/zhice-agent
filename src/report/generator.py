@@ -32,7 +32,10 @@ SECTION_LABELS = [
 ]
 
 
-async def generate_report(parsed: dict[str, Any]) -> dict[str, Any]:
+async def generate_report(
+    parsed: dict[str, Any],
+    reasoning_effort: str | None = None,
+) -> dict[str, Any]:
     """生成完整的销售策略报告。
 
     Phase 3：外部爬虫 + 内部 RAG 双源检索。
@@ -40,6 +43,8 @@ async def generate_report(parsed: dict[str, Any]) -> dict[str, Any]:
 
     Args:
         parsed: parse_user_input() 的返回值
+        reasoning_effort: 推理强度，传给底层 LLM 调用（"low"/"medium"/"high"）。
+                          None=模型默认。设为 "low" 可大幅加速（减少推理 token 消耗）。
 
     Returns:
         dict: 包含各节内容和元数据的报告字典
@@ -94,6 +99,7 @@ async def generate_report(parsed: dict[str, Any]) -> dict[str, Any]:
                 section_num=section_num,
                 template_vars=template_vars,
                 max_tokens=4000,
+                reasoning_effort=reasoning_effort,
             )
             key = SECTION_NAMES[section_num - 1]
             report_data[key] = content
@@ -122,10 +128,10 @@ async def generate_report(parsed: dict[str, Any]) -> dict[str, Any]:
     # ── 并行生成无依赖的章节（5 和 6 都只依赖 S4 的 strategy）───
     logger.info("并行生成第 5、6 节...")
     s5_task = asyncio.create_task(
-        _generate_section(5, template_vars, max_tokens=4000)
+        _generate_section(5, template_vars, max_tokens=4000, reasoning_effort=reasoning_effort)
     )
     s6_task = asyncio.create_task(
-        _generate_section(6, template_vars, max_tokens=4000)
+        _generate_section(6, template_vars, max_tokens=4000, reasoning_effort=reasoning_effort)
     )
 
     try:
@@ -208,6 +214,7 @@ async def _generate_section(
     template_vars: dict[str, Any],
     max_retries: int = 1,
     max_tokens: int = 4000,
+    reasoning_effort: str | None = None,
 ) -> str:
     """生成单个章节，带智能重试逻辑（Phase 2：接入 RAG）
 
@@ -215,6 +222,10 @@ async def _generate_section(
       - 瞬态错误（超时/限流/连接失败）: 指数退避重试
       - 非瞬态错误（认证失败/部署不存在/参数错误）: 立即失败，不重试
       - 推理模型空输出: 倍增加大 max_completion_tokens 后重试
+
+    Args:
+        reasoning_effort: 推理强度（"low"/"medium"/"high"），None=模型默认。
+                         设为 "low" 可大幅加速生成（减少推理 token 占比）。
     """
     from src.llm.azure_client import (
         chat_completion, classify_llm_error, is_reasoning_model,
@@ -239,10 +250,12 @@ async def _generate_section(
     )
 
     # 推理模型自适应 token 预算
+    # reasoning_effort 显式设为 low/medium 时跳过自动提升（模型不会再耗尽预算）
     from src.utils.config import settings
     is_reasoning = is_reasoning_model(settings.azure_openai_deployment)
     effective_tokens = max_tokens
-    if is_reasoning and effective_tokens < REASONING_MIN_EFFECTIVE:
+    skip_token_upgrade = reasoning_effort in ("low", "medium")
+    if is_reasoning and not skip_token_upgrade and effective_tokens < REASONING_MIN_EFFECTIVE:
         effective_tokens = REASONING_MIN_EFFECTIVE
 
     last_error: Exception | None = None
@@ -253,6 +266,7 @@ async def _generate_section(
                 messages,
                 temperature=0.3,
                 max_tokens=effective_tokens,
+                reasoning_effort=reasoning_effort,
             )
             if content and len(content.strip()) > 20:
                 elapsed = time.monotonic() - t_start
