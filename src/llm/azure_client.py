@@ -15,7 +15,17 @@ gpt-5-nano 推理模型特性：
 
 from __future__ import annotations
 
+import httpx
 from openai import AsyncAzureOpenAI, AzureOpenAI
+from openai import (
+    AuthenticationError,
+    NotFoundError,
+    BadRequestError,
+    RateLimitError,
+    APITimeoutError,
+    APIConnectionError,
+    InternalServerError,
+)
 from src.utils.config import settings
 from src.utils.logger import logger
 
@@ -36,10 +46,13 @@ def _get_endpoint(preferred: str, fallback: str) -> str:
 def get_chat_client() -> AsyncAzureOpenAI:
     """获取 Chat（LLM）用的 AsyncAzureOpenAI 客户端"""
     endpoint = _get_endpoint(settings.azure_openai_endpoint, "")
+    # 显式设置 HTTP 超时，避免模型端点不可达时挂起 10 分钟
+    http_client = httpx.AsyncClient(timeout=90.0)
     return AsyncAzureOpenAI(
         azure_endpoint=endpoint,
         api_key=settings.azure_openai_api_key,
         api_version=settings.azure_openai_api_version,
+        http_client=http_client,
     )
 
 
@@ -104,6 +117,53 @@ async def chat_completion(
     except Exception as e:
         logger.error(f"Azure AI Foundry Chat 调用失败: {e}", exc_info=True)
         raise
+
+
+# ── 错误分类工具（供 generator 等调用方做重试决策）──────────────
+
+RETRYABLE_ERRORS = (
+    RateLimitError,
+    APITimeoutError,
+    APIConnectionError,
+    InternalServerError,
+)
+NON_RETRYABLE_ERRORS = (
+    AuthenticationError,
+    NotFoundError,
+    BadRequestError,
+)
+
+
+def is_retryable_error(exc: Exception) -> bool:
+    """判断异常是否属于可重试的瞬态错误。"""
+    return isinstance(exc, RETRYABLE_ERRORS)
+
+
+def classify_llm_error(exc: Exception) -> tuple[str, bool]:
+    """分类 LLM 调用异常，返回 (人类可读原因, 是否可重试)。
+
+    Examples:
+        >>> classify_llm_error(APITimeoutError("..."))
+        ("模型服务响应超时", True)
+        >>> classify_llm_error(AuthenticationError("..."))
+        ("API Key 认证失败，请检查 Azure 配置", False)
+    """
+    if isinstance(exc, AuthenticationError):
+        return "API Key 认证失败，请检查 Azure 配置", False
+    if isinstance(exc, NotFoundError):
+        return "模型部署不存在（请确认 deployment 名称正确）", False
+    if isinstance(exc, BadRequestError):
+        return f"请求参数错误: {exc}", False
+    if isinstance(exc, RateLimitError):
+        return "模型服务限流，请稍后再试", True
+    if isinstance(exc, APITimeoutError):
+        return "模型服务响应超时（Azure 端点可能暂时不可用）", True
+    if isinstance(exc, APIConnectionError):
+        return "网络连接失败，无法访问 Azure 端点", True
+    if isinstance(exc, InternalServerError):
+        return "Azure 服务端内部错误", True
+    # 兜底：未知异常，保守重试一次
+    return f"未知错误: {exc}", True
 
 
 def _get_sync_embedding_client() -> AzureOpenAI:

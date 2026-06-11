@@ -7,7 +7,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from src.llm.azure_client import chat_completion
+from src.llm.azure_client import chat_completion, classify_llm_error, is_retryable_error
 from src.llm.prompt_templates import build_section_messages
 from src.utils.config import settings
 from src.utils.logger import logger
@@ -93,7 +93,6 @@ async def generate_report(parsed: dict[str, Any]) -> dict[str, Any]:
             content = await _generate_section(
                 section_num=section_num,
                 template_vars=template_vars,
-                max_retries=2,
                 max_tokens=4000,
             )
             key = SECTION_NAMES[section_num - 1]
@@ -109,9 +108,10 @@ async def generate_report(parsed: dict[str, Any]) -> dict[str, Any]:
                 template_vars["strategy"] = _truncate(content, 200)
 
         except Exception as e:
-            logger.error(f"第 {section_num} 节生成失败: {e}")
+            error_msg = str(e)
+            logger.error(f"第 {section_num} 节生成失败: {error_msg}")
             key = SECTION_NAMES[section_num - 1]
-            report_data[key] = f"[生成失败：{str(e)[:100]}]"
+            report_data[key] = f"[生成失败：{error_msg[:200]}]"
 
     # ── Section 3 交叉销售（固定占位，不调用 LLM）──────────────
     content = "🚧 交叉销售机会分析功能暂未上线，敬请期待。"
@@ -122,10 +122,10 @@ async def generate_report(parsed: dict[str, Any]) -> dict[str, Any]:
     # ── 并行生成无依赖的章节（5 和 6 都只依赖 S4 的 strategy）───
     logger.info("并行生成第 5、6 节...")
     s5_task = asyncio.create_task(
-        _generate_section(5, template_vars, max_retries=2, max_tokens=4000)
+        _generate_section(5, template_vars, max_tokens=4000)
     )
     s6_task = asyncio.create_task(
-        _generate_section(6, template_vars, max_retries=2, max_tokens=4000)
+        _generate_section(6, template_vars, max_tokens=4000)
     )
 
     try:
@@ -134,7 +134,7 @@ async def generate_report(parsed: dict[str, Any]) -> dict[str, Any]:
         report_data["sections"]["5"] = s5_content
     except Exception as e:
         logger.error(f"第 5 节生成失败: {e}")
-        report_data["talk_script"] = f"[生成失败：{str(e)[:100]}]"
+        report_data["talk_script"] = f"[生成失败：{str(e)[:200]}]"
 
     try:
         s6_content = await s6_task
@@ -142,7 +142,7 @@ async def generate_report(parsed: dict[str, Any]) -> dict[str, Any]:
         report_data["sections"]["6"] = s6_content
     except Exception as e:
         logger.error(f"第 6 节生成失败: {e}")
-        report_data["action_plan"] = f"[生成失败：{str(e)[:100]}]"
+        report_data["action_plan"] = f"[生成失败：{str(e)[:200]}]"
 
     # ── 收集 RAG 来源（去重）──────────────────────────────────
     report_data["sources"] = _collect_sources(company)
@@ -206,10 +206,15 @@ async def _fire_crawl(company: str) -> None:
 async def _generate_section(
     section_num: int,
     template_vars: dict[str, Any],
-    max_retries: int = 2,
+    max_retries: int = 1,
     max_tokens: int = 4000,
 ) -> str:
-    """生成单个章节，带重试逻辑（Phase 2：接入 RAG）"""
+    """生成单个章节，带智能重试逻辑（Phase 2：接入 RAG）
+
+    重试策略：
+      - 瞬态错误（超时/限流/连接失败）: 指数退避重试
+      - 非瞬态错误（认证失败/部署不存在/参数错误）: 立即失败，不重试
+    """
     t_start = time.monotonic()
     # RAG 检索：根据公司名 + 章节主题检索飞书 Wiki 相关知识
     from src.rag.retriever import retrieve_for_report, format_rag_context
@@ -229,6 +234,8 @@ async def _generate_section(
         **template_vars,
     )
 
+    last_error: Exception | None = None
+
     for attempt in range(1, max_retries + 2):  # 首次 + max_retries 次重试
         try:
             content = await chat_completion(
@@ -243,14 +250,26 @@ async def _generate_section(
             else:
                 logger.warning(f"第 {section_num} 节返回内容过短，重试 {attempt}")
         except Exception as e:
-            logger.warning(f"第 {section_num} 节第 {attempt} 次尝试失败: {e}")
+            last_error = e
+            reason, retryable = classify_llm_error(e)
+            logger.warning(
+                f"第 {section_num} 节第 {attempt} 次尝试失败: {reason}"
+            )
+
+            if not retryable:
+                # 非瞬态错误：直接抛出，不再重试浪费时间和 token
+                raise RuntimeError(f"第 {section_num} 节失败 — {reason}") from e
+
             if attempt <= max_retries:
-                await asyncio.sleep(2 * attempt)  # 指数退避
+                backoff = min(2 * attempt, 8)  # 指数退避，上限 8 秒
+                logger.info(f"第 {section_num} 节等待 {backoff}s 后重试...")
+                await asyncio.sleep(backoff)
             else:
-                raise
+                break
 
     # 所有重试均失败
-    raise RuntimeError(f"第 {section_num} 节生成失败（已重试 {max_retries} 次）")
+    reason, _ = classify_llm_error(last_error) if last_error else ("未知错误", False)
+    raise RuntimeError(f"第 {section_num} 节失败 — {reason}（已重试 {max_retries} 次）")
 
 
 def _truncate(text: str, max_len: int = 300) -> str:
