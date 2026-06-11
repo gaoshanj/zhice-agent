@@ -1,9 +1,10 @@
-"""飞书 Webhook 处理层 — Phase 1 实现"""
+"""飞书 Webhook 处理层 — Phase 4 实现"""
 
 import hmac
 import hashlib
 import json
 import base64
+import re
 import time
 from fastapi import APIRouter, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -14,6 +15,26 @@ from src.report.generator import generate_report
 from src.bot.card_builder import build_report_card
 
 router = APIRouter()
+
+# ── 全链路健康检测关键词 ─────────────────────────────────────
+# 这些关键词不触发 Agent 报告功能，而是直连 LLM 验证全链路通畅
+HEALTH_CHECK_KEYWORDS = [
+    "你好", "hi", "hello", "hey", "嗨",
+    "ping", "test", "测试", "在吗", "在不在",
+    "能听到吗", "能听到",
+]
+HEALTH_CHECK_PATTERN = re.compile(
+    r"^\s*(" + "|".join(re.escape(k) for k in HEALTH_CHECK_KEYWORDS) + r")\s*[!！。.？?]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_health_check(content: str) -> bool:
+    """检测是否为全链路健康检查消息（纯打招呼/test/ping，不触发报告功能）"""
+    stripped = content.strip()
+    # 去掉 @机器人 前缀
+    stripped = re.sub(r"^@\S+\s*", "", stripped).strip()
+    return bool(HEALTH_CHECK_PATTERN.match(stripped))
 
 
 def _verify_signature(body: bytes, timestamp: str, nonce: str, encrypt_key: str) -> bool:
@@ -65,9 +86,64 @@ def _parse_event_body(body: dict) -> dict | None:
     }
 
 
+async def _handle_health_check(chat_id: str, msg_id: str, content: str):
+    """全链路健康检测：飞书 → Azure → LLM → 飞书回复
+
+    不触发 Agent 报告逻辑，单纯直连 LLM 验证全链路通畅。
+    检测飞书接收、Web Service 处理、LLM 连接、飞书回复四个环节。
+    """
+    t0 = time.monotonic()
+    try:
+        from src.llm.azure_client import chat_completion
+
+        health_messages = [
+            {"role": "system", "content": (
+                "你是培训智策 Agent 的运维助手。用户正在做全链路连通性检测。"
+                "请用一句话回复，确认系统运行正常，并简要说明当前可用的能力。"
+                "语气友好简洁，不超过 80 字。"
+            )},
+            {"role": "user", "content": content},
+        ]
+
+        logger.info(f"🔍 健康检测开始，用户消息: {content[:50]}")
+        llm_response = await chat_completion(
+            health_messages,
+            max_tokens=200,
+            reasoning_effort="low",  # 快速响应，不需要深度推理
+        )
+        elapsed = time.monotonic() - t0
+        logger.info(f"✅ 健康检测完成，LLM 耗时 {elapsed:.1f}s，回复: {llm_response[:80]}")
+
+        # 返回带有链路信息的回复
+        reply_text = (
+            f"{llm_response}\n\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"🔗 全链路状态\n"
+            f"  飞书接收 ✅ | Azure WS ✅ | LLM ✅ ({elapsed:.1f}s) | 飞书回复 ✅"
+        )
+        await _reply_text(chat_id, msg_id, reply_text)
+
+    except Exception as e:
+        elapsed = time.monotonic() - t0
+        logger.error(f"❌ 健康检测失败 ({elapsed:.1f}s): {e}", exc_info=True)
+        await _reply_text(
+            chat_id, msg_id,
+            f"❌ 链路检测失败 ({elapsed:.1f}s)\n"
+            f"错误: {type(e).__name__}: {str(e)[:150]}\n\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"🔗 全链路状态\n"
+            f"  飞书接收 ✅ | Azure WS ✅ | LLM ❌ | 飞书回复 ✅"
+        )
+
+
 async def _handle_user_message(chat_id: str, msg_id: str, content: str):
     """后台任务：解析输入 → 生成报告 → 推送飞书卡片"""
     try:
+        # Step 0: 全链路健康检测（纯打招呼/test/ping 直连 LLM，不触发报告）
+        if _is_health_check(content):
+            await _handle_health_check(chat_id, msg_id, content)
+            return
+
         # Step 1: 解析用户输入（Regex 优先）
         parsed = parse_user_input(content)
         company = parsed.get("company", "")
