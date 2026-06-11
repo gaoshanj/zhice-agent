@@ -291,6 +291,49 @@ def build_section_messages(section_num: int, **kwargs) -> list[dict]:
     ]
 
 
+# ── 实体提取（用户输入解析兜底）─────────────────────────────────
+
+ENTITY_EXTRACTION_PROMPT = """你是一个中文 NER（命名实体识别）助手。从用户的自然语言消息中提取以下字段，以 JSON 格式返回。
+
+## 提取规则
+
+### company（客户公司名称）
+- 提取消息中提到的目标客户公司名称
+- 优先识别"拜访XX""去XX拜访""针对XX"上下文中的公司名
+- 公司名可能包含或不包含"公司""集团""有限""科技"等后缀
+- 如果公司名后没有后缀（如"百济神州"），也要完整提取
+- **关键：不要将产品名、技术名（如 Copilot、Azure、Power BI）误识别为公司名**
+
+### visit_purpose（拜访目的）
+- 提取消息中描述的拜访意图或需求
+- 例如"推广XX培训""了解XX需求""首次接触"等
+- 如果消息中提及了具体产品/技术（如 Copilot Studio、AI Agent），将其纳入拜访目的
+
+### focus_areas（侧重方向，数组）
+- 从消息中识别提到的技术/产品方向
+- 可选值包括：微软Agent培训、Copilot、AI Agent、Azure培训、AWS培训、MSP、安服、MA、Power BI、数据培训 等
+- 返回数组，如 ["Copilot", "AI Agent"]
+
+### visit_target（拜访对象）
+- 如果消息中明确提到拜访对象的部门或职位（如"技术研发部""CTO"），提取出来
+- 否则返回空字符串 ""
+
+### known_info（已知信息）
+- 如果消息中包含客户背景描述，提取出来
+- 否则返回空字符串 ""
+
+## 输出格式
+仅返回一个 JSON 对象，不要包含其他文字："""
+
+
+def build_extraction_messages(text: str) -> list[dict]:
+    """构建实体提取的 messages"""
+    return [
+        {"role": "system", "content": "你是一个精确的中文实体提取工具。只返回 JSON，不返回任何解释。"},
+        {"role": "user", "content": f"{ENTITY_EXTRACTION_PROMPT}\n\n用户消息：\n{text}"},
+    ]
+
+
 def build_summary_messages(report_data: dict) -> list[dict]:
     """（预留）生成报告摘要的 messages"""
     return [

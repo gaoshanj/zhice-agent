@@ -68,12 +68,32 @@ def _parse_event_body(body: dict) -> dict | None:
 async def _handle_user_message(chat_id: str, msg_id: str, content: str):
     """后台任务：解析输入 → 生成报告 → 推送飞书卡片"""
     try:
-        # Step 1: 解析用户输入
+        # Step 1: 解析用户输入（Regex 优先）
         parsed = parse_user_input(content)
         company = parsed.get("company", "")
+
+        # Step 1b: Regex 失败 → LLM 兜底提取
         if not company:
-            await _reply_text(chat_id, msg_id, _build_help_text())
-            return
+            from src.bot.message_parser import extract_entities_via_llm
+            from src.utils.logger import logger as _logger
+            _logger.info(f"Regex 未提取到公司名，使用 LLM 兜底提取...")
+            llm_parsed = await extract_entities_via_llm(content)
+            if llm_parsed and llm_parsed.get("company"):
+                company = llm_parsed.get("company", "")
+                # 合并 LLM 提取结果到 parsed
+                parsed["company"] = company
+                if llm_parsed.get("visit_purpose"):
+                    parsed["visit_purpose"] = llm_parsed["visit_purpose"]
+                if llm_parsed.get("focus_areas"):
+                    parsed["focus_areas"] = llm_parsed["focus_areas"]
+                if llm_parsed.get("visit_target"):
+                    parsed["visit_target"] = llm_parsed["visit_target"]
+                if llm_parsed.get("known_info"):
+                    parsed["known_info"] = llm_parsed["known_info"]
+                _logger.info(f"LLM 兜底提取成功: company={company}")
+            else:
+                await _reply_text(chat_id, msg_id, _build_help_text())
+                return
 
         # Step 2: 发送"正在生成"提示
         await _reply_text(
