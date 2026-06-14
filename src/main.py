@@ -20,9 +20,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from src.bot.feishu_handler import router as feishu_router
-from src.rag.vector_store import collection_count
+from src.rag.vector_store import _get_collection, collection_count
 from src.utils.config import settings
 from src.utils.logger import logger
+
+# 索引 schema 版本：修改 build_bitable_index.py 后递增此值
+# 用于 _auto_build_on_startup 检测是否需要强制重建
+_CHROMA_SCHEMA_VERSION = 3  # dc91f15: Lookup 字段 option_id 映射
 
 # 根目录 .env 加载（本地开发用；App Service 从环境变量读取）
 env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
@@ -272,6 +276,16 @@ def _run_bitable_build():
             doc_count = collection_count()
             _bitable_build_state["status"] = "success"
             _bitable_build_state["doc_count"] = doc_count
+            # 写入 schema 版本标记，下次启动时用于判断是否需要重建
+            try:
+                coll = _get_collection(settings.chroma_collection_internal)
+                coll.modify(metadata={
+                    **(coll.metadata if coll.metadata else {}),
+                    "schema_version": str(_CHROMA_SCHEMA_VERSION),
+                    "hnsw:space": "cosine",  # 保留原有配置
+                })
+            except Exception as ve:
+                logger.warning(f"写入 schema_version 失败: {ve}")
             logger.info(f"✅ Bitable 索引构建完成（耗时 {elapsed:.1f}s，共 {doc_count} 条）")
         except BaseException as e:
             elapsed = time.time() - start
@@ -284,24 +298,44 @@ def _run_bitable_build():
 
 
 def _auto_build_on_startup():
-    """启动时检查 ChromaDB 是否为空，若为空则延迟 30s 自动重建索引。
+    """启动时检查 ChromaDB 是否需要重建索引。
 
-    这个函数解决了 Azure App Service 每次 CI/CD 部署后 ChromaDB
-    内存状态清空的问题。不再依赖 ci.yml 的外部协调——
+    触发条件（任一满足即重建）：
+    1. 集合为空（docs == 0）
+    2. 代码版本变更（存储的 schema_version != _CHROMA_SCHEMA_VERSION）
+       - 当 build_bitable_index.py 有 schema 变化时递增 _CHROMA_SCHEMA_VERSION
+
+    解决了 Azure App Service 每次 CI/CD 部署后 ChromaDB 持久化数据与
+    新代码不匹配的问题。不再依赖 ci.yml 的外部协调——
     App 启动后自己检测并修复。
     """
     try:
-        docs = _chroma_status()
+        docs = collection_count()
     except Exception:
         docs = -1
 
+    # 检查存储的 schema 版本
+    stored_version = 0
     if docs > 0:
-        logger.info(f"📊 ChromaDB internal_docs: {docs} 条（已就绪，跳过自动重建）")
+        try:
+            coll = _get_collection(settings.chroma_collection_internal)
+            stored_version = int(coll.metadata.get("schema_version", "0") if coll.metadata else "0")
+        except Exception:
+            stored_version = 0
+
+    if docs > 0 and stored_version >= _CHROMA_SCHEMA_VERSION:
+        logger.info(
+            f"📊 ChromaDB internal_docs: {docs} 条, "
+            f"schema_version={stored_version}（已就绪，跳过重建）"
+        )
         return
 
+    reason = "集合为空" if docs <= 0 else (
+        f"schema_version {stored_version} < {_CHROMA_SCHEMA_VERSION}"
+    )
     logger.warning(
-        f"⚠️ ChromaDB internal_docs 为空（当前 {docs} 条），"
-        f"将在 30s 后自动重建索引..."
+        f"⚠️ ChromaDB 需重建: {reason}（当前 {docs} 条），"
+        f"将在 30s 后自动重建..."
     )
 
     def _delayed_rebuild():
