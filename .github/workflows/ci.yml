@@ -42,3 +42,53 @@ jobs:
         with:
           app-name: "zhice-agent"
           publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+
+  # ── 部署后自动重建 Bitable RAG 索引 ──────────────────
+  rebuild-index:
+    name: Rebuild Bitable Index After Deploy
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - name: Wait for Azure App to warm up
+        run: sleep 60
+
+      - name: Trigger Bitable index rebuild
+        id: trigger
+        run: |
+          HTTP_CODE=$(curl -s -o /tmp/bitable_response.json -w "%{http_code}" \
+            -X POST "${{ secrets.APP_BASE_URL }}/admin/build-bitable-index?secret=${{ secrets.REBUILD_INDEX_SECRET }}")
+
+          echo "HTTP Status: $HTTP_CODE"
+          cat /tmp/bitable_response.json
+
+          if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "202" ]; then
+            echo "❌ Index build trigger failed (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+          echo "✅ Index rebuild triggered"
+
+      - name: Wait for index build to complete
+        run: sleep 30
+
+      - name: Poll until index ready (max 10 min)
+        run: |
+          MAX_ATTEMPTS=30
+          ATTEMPT=0
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            RESPONSE=$(curl -s "${{ secrets.APP_BASE_URL }}/health")
+            CHROMA_DOCS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('chroma_docs', -1))" 2>/dev/null || echo "-1")
+            BUILD_STATE=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('bitable_build_state', 'N/A'))" 2>/dev/null || echo "N/A")
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS: chroma_docs=$CHROMA_DOCS, build_state=$BUILD_STATE"
+            if [ "$CHROMA_DOCS" -gt 0 ] 2>/dev/null; then
+              echo "✅ Bitable 索引重建成功！共 $CHROMA_DOCS 条文档"
+              exit 0
+            fi
+            if [ "$BUILD_STATE" = "failed" ]; then
+              echo "❌ 索引构建失败，查看 Azure 日志排查原因"
+              exit 1
+            fi
+            sleep 20
+          done
+          echo "⚠️ 索引构建超时（可能仍在运行，请手动确认）"
