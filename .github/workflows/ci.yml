@@ -43,9 +43,11 @@ jobs:
           app-name: "zhice-agent"
           publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
 
-  # ── 部署后自动重建 Bitable RAG 索引 ──────────────────
+  # ── 部署后等待 Bitable RAG 索引就绪 ─────────────────
+  # App 启动时会自动检测 chroma_docs==0 并延迟 30s 重建索引。
+  # 此 job 只需轮询等待索引构建完成即可，无需手动触发。
   rebuild-index:
-    name: Rebuild Bitable Index After Deploy
+    name: Wait for Bitable Index Ready
     needs: deploy
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
@@ -55,112 +57,67 @@ jobs:
           BASE_URL="${{ secrets.APP_BASE_URL }}"
           echo "📡 APP_BASE_URL = $BASE_URL"
 
-          # 确保有 https:// 前缀
+          if [ -z "$BASE_URL" ]; then
+            echo "❌ APP_BASE_URL 未配置！请在 GitHub Secrets 中设置"
+            exit 1
+          fi
+
           if [[ "$BASE_URL" != https://* ]] && [[ "$BASE_URL" != http://* ]]; then
             BASE_URL="https://${BASE_URL}"
             echo "⚠️ 自动补充 https:// 前缀 → $BASE_URL"
           fi
 
-          # 提取域名用于诊断
           DOMAIN=$(echo "$BASE_URL" | sed 's|https\?://||' | cut -d/ -f1)
           echo "域名: $DOMAIN"
 
-          # DNS 预解析（提前暴露 DNS 问题）
-          echo "DNS 解析测试..."
-          nslookup "$DOMAIN" || { echo "❌ DNS 解析失败，请检查 APP_BASE_URL 是否正确"; exit 1; }
+          nslookup "$DOMAIN" || { echo "❌ DNS 解析失败，请检查 URL"; exit 1; }
           echo "✅ DNS 解析成功"
 
-          # 写入环境变量供后续步骤使用
           echo "BASE_URL=$BASE_URL" >> $GITHUB_ENV
 
-      - name: Wait for Azure App to warm up (poll /health)
+      - name: Poll until ChromaDB index ready (max 20 min)
         run: |
-          MAX_WAIT=180   # 最多等 3 分钟
-          INTERVAL=10
-          ELAPSED=0
-
-          echo "⏳ 等待 Azure App Service 启动（最多 ${MAX_WAIT}s）..."
-          while [ $ELAPSED -lt $MAX_WAIT ]; do
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-              --connect-timeout 5 --max-time 10 \
-              "${{ env.BASE_URL }}/health" 2>/dev/null) || HTTP_CODE="000"
-
-            if [ "$HTTP_CODE" = "200" ]; then
-              echo "✅ Azure App 已就绪！（${ELAPSED}s）"
-              exit 0
-            fi
-
-            echo "  ... 等待中 (${ELAPSED}/${MAX_WAIT}s, HTTP=$HTTP_CODE)"
-            sleep $INTERVAL
-            ELAPSED=$((ELAPSED + INTERVAL))
-          done
-
-          echo "❌ Azure App 在 ${MAX_WAIT}s 内未就绪"
-          echo "提示：检查 Azure Portal 确认应用状态正常"
-          exit 1
-
-      - name: Trigger Bitable index rebuild (with retry)
-        id: trigger
-        run: |
-          MAX_RETRIES=5
-          RETRY=0
-
-          while [ $RETRY -lt $MAX_RETRIES ]; do
-            RETRY=$((RETRY + 1))
-            echo "🔄 触发索引重建（第 $RETRY/$MAX_RETRIES 次）..."
-
-            HTTP_CODE=$(curl -s -o /tmp/bitable_response.json -w "%{http_code}" \
-              --connect-timeout 15 --max-time 60 \
-              -X POST "${{ env.BASE_URL }}/admin/build-bitable-index?secret=${{ secrets.REBUILD_INDEX_SECRET }}")
-
-            CURL_EXIT=$?
-            echo "  HTTP Status: $HTTP_CODE (curl exit: $CURL_EXIT)"
-
-            if [ -f /tmp/bitable_response.json ]; then
-              cat /tmp/bitable_response.json
-            fi
-
-            # 检查是否成功
-            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "202" ]; then
-              echo "✅ 索引重建触发成功（HTTP $HTTP_CODE）"
-              exit 0
-            fi
-
-            # DNS 失败（exit code 6）或连接失败 → 重试并等待更久
-            if [ $CURL_EXIT -ne 0 ]; then
-              echo "⚠️ 网络错误 (curl exit $CURL_EXIT)，等待后重试..."
-              sleep 15
-            else
-              # 收到了 HTTP 响应但不是 200/202 → 可能是服务端错误，也重试
-              echo "⚠️ 服务端返回 HTTP $HTTP_CODE，等待后重试..."
-              sleep 10
-            fi
-          done
-
-          echo "❌ 索引重建触发失败（已重试 $MAX_RETRIES 次）"
-          exit 1
-
-      - name: Wait for index build to complete
-        run: sleep 30
-
-      - name: Poll until index ready (max 10 min)
-        run: |
-          MAX_ATTEMPTS=30
+          MAX_ATTEMPTS=60
           ATTEMPT=0
+
+          echo "⏳ App 启动后会自动重建 Bitable 索引，等待就绪（最多 20 分钟）..."
+          echo ""
+
           while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
             ATTEMPT=$((ATTEMPT + 1))
-            RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 "${{ env.BASE_URL }}/health")
-            CHROMA_DOCS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('chroma_docs', -1))" 2>/dev/null || echo "-1")
-            BUILD_STATE=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('bitable_build_state', 'N/A'))" 2>/dev/null || echo "N/A")
-            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS: chroma_docs=$CHROMA_DOCS, build_state=$BUILD_STATE"
+
+            RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+              "${{ env.BASE_URL }}/health" 2>/dev/null) || RESPONSE=""
+
+            if [ -z "$RESPONSE" ]; then
+              echo "  [${ATTEMPT}/${MAX_ATTEMPTS}] App 尚未就绪，等待启动..."
+              sleep 20
+              continue
+            fi
+
+            CHROMA_DOCS=$(echo "$RESPONSE" | python3 -c \
+              "import sys,json; print(json.load(sys.stdin).get('chroma_docs', -1))" \
+              2>/dev/null || echo "-1")
+            BUILD_STATE=$(echo "$RESPONSE" | python3 -c \
+              "import sys,json; print(json.load(sys.stdin).get('bitable_build_state', 'N/A'))" \
+              2>/dev/null || echo "N/A")
+
+            echo "  [${ATTEMPT}/${MAX_ATTEMPTS}] chroma_docs=$CHROMA_DOCS, build_state=$BUILD_STATE"
+
             if [ "$CHROMA_DOCS" -gt 0 ] 2>/dev/null; then
-              echo "✅ Bitable 索引重建成功！共 $CHROMA_DOCS 条文档"
+              echo ""
+              echo "✅ Bitable RAG 索引就绪！共 $CHROMA_DOCS 条文档"
               exit 0
             fi
+
             if [ "$BUILD_STATE" = "failed" ]; then
-              echo "❌ 索引构建失败，查看 Azure 日志排查原因"
+              echo ""
+              echo "❌ 索引构建失败，请查看 Azure App Service 日志"
               exit 1
             fi
+
             sleep 20
           done
-          echo "⚠️ 索引构建超时（可能仍在运行，请手动确认）"
+
+          echo ""
+          echo "⚠️ 索引构建超时（${MAX_ATTEMPTS} 次轮询），请手动检查 Azure 状态"
