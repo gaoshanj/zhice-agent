@@ -26,6 +26,7 @@ from src.crawler.llm_verifier import (
     extract_jobs_batch,
     verify_news_batch,
 )
+from src.models.company_context import CompanyContext, build_company_context
 from src.rag.vector_store import add_chunks, similarity_search, collection_count
 from src.utils.config import settings
 from src.utils.logger import logger
@@ -179,6 +180,7 @@ async def crawl_and_store(
             "elapsed": float,        # 耗时秒数
             "errors": list[str],     # 错误信息（如有）
             "bitable_errors": list[str],  # Bitable 写入错误
+            "context": CompanyContext | None,  # 路线B：结构化公司上下文（含完整URL）
         }
     """
     start = time.monotonic()
@@ -394,6 +396,14 @@ async def crawl_and_store(
 
     if result["bitable_written"]:
         logger.info(f"[爬虫调度] Bitable 写入: {result['bitable_written']} 条")
+
+    # ── 路线B：构建 CompanyContext（结构化上下文，含完整URL）────
+    result["context"] = build_company_context(
+        company=company,
+        web_info=raw_web_info,
+        jobs=raw_jobs,
+        news_items=raw_news,
+    )
 
     result["elapsed"] = round(time.monotonic() - start, 1)
     logger.info(

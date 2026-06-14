@@ -1,4 +1,4 @@
-"""报告生成主逻辑 — Phase 3（外部爬虫 + 内部 RAG 双源检索）"""
+"""报告生成主逻辑 — Phase 4 路线B（CompanyContext 结构化注入）"""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from typing import Any
 
 from src.llm.azure_client import chat_completion, classify_llm_error
 from src.llm.prompt_templates import build_section_messages
+from src.models.company_context import CompanyContext
 from src.utils.config import settings
 from src.utils.logger import logger
 
@@ -61,6 +62,7 @@ async def generate_report(
     crawl_task = asyncio.create_task(
         asyncio.wait_for(crawl_and_store(company=company, timeout=35.0), timeout=40.0)
     )
+    company_ctx: CompanyContext | None = None
     try:
         crawl_result = await crawl_task
         if crawl_result.get("chunks_stored", 0) > 0:
@@ -71,6 +73,15 @@ async def generate_report(
             )
         else:
             logger.info(f"爬虫完成: {company} — 无新增外部数据")
+        # 路线B：提取 CompanyContext（含完整 URL 溯源）
+        company_ctx = crawl_result.get("context")
+        if company_ctx and company_ctx.has_any_data:
+            logger.info(
+                f"CompanyContext 已构建: "
+                f"官网={'有' if company_ctx.website_summary else '无'}, "
+                f"职位={company_ctx.job_count}, "
+                f"新闻={company_ctx.news_count}"
+            )
     except asyncio.TimeoutError:
         logger.warning(f"外部爬虫超时: {company}（继续使用已有数据生成报告）")
     except Exception as e:
@@ -111,6 +122,7 @@ async def generate_report(
                 template_vars=template_vars,
                 max_tokens=4000,
                 reasoning_effort=reasoning_effort,
+                company_ctx=company_ctx,
             )
             key = SECTION_NAMES[section_num - 1]
             report_data[key] = content
@@ -139,10 +151,10 @@ async def generate_report(
     # ── 并行生成无依赖的章节（5 和 6 都只依赖 S4 的 strategy）───
     logger.info("并行生成第 5、6 节...")
     s5_task = asyncio.create_task(
-        _generate_section(5, template_vars, max_tokens=4000, reasoning_effort=reasoning_effort)
+        _generate_section(5, template_vars, max_tokens=4000, reasoning_effort=reasoning_effort, company_ctx=company_ctx)
     )
     s6_task = asyncio.create_task(
-        _generate_section(6, template_vars, max_tokens=4000, reasoning_effort=reasoning_effort)
+        _generate_section(6, template_vars, max_tokens=4000, reasoning_effort=reasoning_effort, company_ctx=company_ctx)
     )
 
     try:
@@ -162,7 +174,7 @@ async def generate_report(
         report_data["action_plan"] = f"[生成失败：{str(e)[:200]}]"
 
     # ── 收集 RAG 来源（去重）──────────────────────────────────
-    report_data["sources"] = _collect_sources(company)
+    report_data["sources"] = _collect_sources(company, company_ctx)
 
     t_report_elapsed = time.monotonic() - t_report_start
     logger.info(
@@ -172,14 +184,17 @@ async def generate_report(
     return report_data
 
 
-def _collect_sources(company: str) -> list[dict[str, str]]:
-    """收集该公司在 RAG 中检索到的所有 Bitable 来源（去重）"""
+def _collect_sources(
+    company: str,
+    company_ctx: CompanyContext | None = None,
+) -> list[dict[str, str]]:
+    """收集该公司在 RAG 中检索到的所有 Bitable 来源 + CompanyContext URL（去重）"""
     from src.rag.retriever import retrieve_for_report_with_meta
 
     seen_urls: set[str] = set()
     sources: list[dict[str, str]] = []
 
-    # 对每一节都检索一次，收集所有来源
+    # 对每一节都检索一次，收集所有 Bitable 来源
     for section_num in (1, 2, 4, 5, 6):
         try:
             results = retrieve_for_report_with_meta(company, section_num, top_k=3)
@@ -195,6 +210,17 @@ def _collect_sources(company: str) -> list[dict[str, str]]:
         except Exception:
             continue
 
+    # 路线B：追加 CompanyContext 中的 URL（官网、招聘、新闻）
+    if company_ctx:
+        for cid, label, url in company_ctx.source_urls:
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                sources.append({
+                    "title": label,
+                    "url": url,
+                    "type": "external",
+                })
+
     return sources
 
 
@@ -204,8 +230,9 @@ async def _generate_section(
     max_retries: int = 1,
     max_tokens: int = 4000,
     reasoning_effort: str | None = None,
+    company_ctx: CompanyContext | None = None,
 ) -> str:
-    """生成单个章节，带智能重试逻辑（Phase 2：接入 RAG）
+    """生成单个章节，带智能重试逻辑（Phase 4 路线B：CompanyContext 结构化注入）
 
     重试策略：
       - 瞬态错误（超时/限流/连接失败）: 指数退避重试
@@ -215,6 +242,8 @@ async def _generate_section(
     Args:
         reasoning_effort: 推理强度（"low"/"medium"/"high"），None=模型默认。
                          设为 "low" 可大幅加速生成（减少推理 token 占比）。
+        company_ctx: 路线B — 结构化公司外部数据上下文（含完整 URL 溯源）。
+                     非 None 时直接注入 Prompt，绕过 ChromaDB metadata。
     """
     from src.llm.azure_client import (
         chat_completion, classify_llm_error, is_reasoning_model,
@@ -237,6 +266,18 @@ async def _generate_section(
         rag_context=rag_context,
         **template_vars,
     )
+
+    # ── 路线B：注入 CompanyContext 结构化数据（含完整 URL 溯源）────
+    # 将爬虫产出的公司上下文作为独立 user message 追加，
+    # 这样 URL 不经过 ChromaDB metadata，100% 传递到 LLM。
+    if company_ctx and company_ctx.has_any_data:
+        ctx_text = company_ctx.format_for_prompt()
+        if ctx_text:
+            messages.append({"role": "user", "content": ctx_text})
+            logger.info(f"第 {section_num} 节已注入 CompanyContext（{len(ctx_text)} 字符）")
+            # 将 CompanyContext 的 URL 合并到 source_map，使 _linkify_sources 生效
+            for cid, label, url in company_ctx.source_urls:
+                source_map[cid] = url
 
     # 推理模型自适应 token 预算
     # reasoning_effort 显式设为 low/medium 时跳过自动提升（模型不会再耗尽预算）
