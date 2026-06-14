@@ -30,22 +30,33 @@ def retrieve_for_report(
 
 
 def _build_source_url(metadata: dict[str, Any]) -> str:
-    """根据 metadata 构造来源链接"""
+    """根据 metadata 构造来源链接
+
+    爬虫 source 值规则：
+      - bitable          ← 飞书 Bitable 知识库
+      - external_website ← 公司官网（URL 存在 website_url 字段）
+      - external_jobs    ← 招聘数据（无独立 URL）
+      - external_news    ← 新闻数据（无独立 URL）
+      - external         ← 通用外部（URL 存在 url 字段，旧格式兼容）
+    """
     source = metadata.get("source", "")
     if source == "bitable":
         base_token = metadata.get("base_token", "")
         table_id = metadata.get("table_id", "")
         record_id = metadata.get("record_id", "")
         if base_token and table_id:
-            # 飞书 Bitable 记录链接（含 record_id 定位到具体行）
             url = f"https://bba12hub36.feishu.cn/base/{base_token}?table={table_id}"
             if record_id:
                 url += f"&record={record_id}"
             return url
-    elif source == "external":
-        url = metadata.get("url", "")
-        if url:
-            return url
+    elif source == "external_website":
+        # 官网爬虫将 URL 存为 website_url
+        url = metadata.get("website_url", "") or metadata.get("url", "")
+        return url
+    elif source in ("external", "external_news", "external_jobs"):
+        # 旧格式 / 新闻 / 招聘：尝试 url 字段
+        url = metadata.get("url", "") or metadata.get("website_url", "")
+        return url
     return ""
 
 
@@ -105,8 +116,22 @@ def retrieve_for_report_with_meta(
 
         meta = r.get("metadata", {})
         source_url = _build_source_url(meta)
-        source_type = meta.get("source", "unknown")
+        raw_source = meta.get("source", "unknown")
+        # 将所有 external_* 统一归类为 "external"，方便下游处理
+        source_type = "external" if raw_source.startswith("external") else raw_source
         title = meta.get("title", "")
+        # 根据 raw_source 生成更具体的标题
+        if not title:
+            if raw_source == "external_website":
+                title = f"{meta.get('company', '')} 官网"
+            elif raw_source == "external_jobs":
+                title = f"{meta.get('company', '')} 招聘信息"
+            elif raw_source == "external_news":
+                title = f"{meta.get('company', '')} 行业新闻"
+            elif source_type == "external":
+                title = "外部数据"
+            else:
+                title = "Bitable 记录"
 
         output.append({
             "content": content,
@@ -114,7 +139,7 @@ def retrieve_for_report_with_meta(
             "distance": r.get("distance"),
             "source_url": source_url,
             "source_type": source_type,
-            "title": title or ("外部数据" if source_type == "external" else "Bitable 记录"),
+            "title": title,
         })
 
     logger.info(
@@ -146,7 +171,8 @@ def format_rag_context(
         if isinstance(ctx, dict):
             structured.append(ctx)
         else:
-            is_external = "外部数据" in ctx[:100]
+            # 旧接口传 str 时：通过关键词猜测是否外部数据
+            is_external = any(kw in ctx[:150] for kw in ("外部数据", "官网信息", "招聘信息", "行业新闻"))
             structured.append({
                 "content": ctx,
                 "source_type": "external" if is_external else "bitable",
