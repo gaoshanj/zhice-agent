@@ -90,7 +90,7 @@ jobs:
               exit 0
             fi
 
-            echo "  ... 等待中 (${ELAPSED}/${MAX_WAIT)s, HTTP=$HTTP_CODE)"
+            echo "  ... 等待中 (${ELAPSED}/${MAX_WAIT}s, HTTP=$HTTP_CODE)"
             sleep $INTERVAL
             ELAPSED=$((ELAPSED + INTERVAL))
           done
