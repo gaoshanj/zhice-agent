@@ -26,7 +26,11 @@ from src.utils.logger import logger
 
 # 索引 schema 版本：修改 build_bitable_index.py 后递增此值
 # 用于 _auto_build_on_startup 检测是否需要强制重建
-_CHROMA_SCHEMA_VERSION = 3  # dc91f15: Lookup 字段 option_id 映射
+_CHROMA_SCHEMA_VERSION = 4  # 5e0a53f+: 外部集合 URL schema 版本对齐
+
+# 外部数据集合 schema 版本：当 job_crawler/news_crawler 的 chunk 格式变化时递增
+# 用于 _auto_build_on_startup 检测是否需要清空外部集合并重新爬取
+_CHROMA_EXTERNAL_SCHEMA_VERSION = 1  # Wave 9: external_jobs/external_news chunks now include source URLs
 
 # 根目录 .env 加载（本地开发用；App Service 从环境变量读取）
 env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
@@ -298,53 +302,103 @@ def _run_bitable_build():
 
 
 def _auto_build_on_startup():
-    """启动时检查 ChromaDB 是否需要重建索引。
+    """启动时检查 ChromaDB 是否需要重建索引 / 清空外部集合。
 
-    触发条件（任一满足即重建）：
-    1. 集合为空（docs == 0）
-    2. 代码版本变更（存储的 schema_version != _CHROMA_SCHEMA_VERSION）
-       - 当 build_bitable_index.py 有 schema 变化时递增 _CHROMA_SCHEMA_VERSION
+    触发条件（任一满足即重建/清空）：
+    1. 内部集合为空（docs == 0）
+    2. 内部 schema_version 落后于 _CHROMA_SCHEMA_VERSION
+    3. 外部 schema_version 落后于 _CHROMA_EXTERNAL_SCHEMA_VERSION
 
-    解决了 Azure App Service 每次 CI/CD 部署后 ChromaDB 持久化数据与
-    新代码不匹配的问题。不再依赖 ci.yml 的外部协调——
-    App 启动后自己检测并修复。
+    内部集合：触发 _run_bitable_build() 30s 后重建。
+    外部集合：直接清空（下次报告生成时爬虫自动重新填充）。
     """
+    need_internal_rebuild = False
+    need_external_clear = False
+
+    # ── 内部集合检查 ──────────────────────────────────────────
     try:
-        docs = collection_count()
+        int_docs = collection_count()
     except Exception:
-        docs = -1
+        int_docs = -1
 
-    # 检查存储的 schema 版本
-    stored_version = 0
-    if docs > 0:
+    int_stored_version = 0
+    if int_docs > 0:
         try:
-            coll = _get_collection(settings.chroma_collection_internal)
-            stored_version = int(coll.metadata.get("schema_version", "0") if coll.metadata else "0")
+            int_coll = _get_collection(settings.chroma_collection_internal)
+            int_stored_version = int(
+                int_coll.metadata.get("schema_version", "0") if int_coll.metadata else "0"
+            )
         except Exception:
-            stored_version = 0
+            int_stored_version = 0
 
-    if docs > 0 and stored_version >= _CHROMA_SCHEMA_VERSION:
-        logger.info(
-            f"📊 ChromaDB internal_docs: {docs} 条, "
-            f"schema_version={stored_version}（已就绪，跳过重建）"
+    if int_docs <= 0:
+        need_internal_rebuild = True
+    elif int_stored_version < _CHROMA_SCHEMA_VERSION:
+        need_internal_rebuild = True
+
+    # ── 外部集合检查 ──────────────────────────────────────────
+    try:
+        ext_docs = collection_count(settings.chroma_collection_external)
+    except Exception:
+        ext_docs = -1
+
+    ext_stored_version = 0
+    if ext_docs > 0:
+        try:
+            ext_coll = _get_collection(settings.chroma_collection_external)
+            ext_stored_version = int(
+                ext_coll.metadata.get("schema_version", "0") if ext_coll.metadata else "0"
+            )
+        except Exception:
+            ext_stored_version = 0
+
+    if ext_docs > 0 and ext_stored_version < _CHROMA_EXTERNAL_SCHEMA_VERSION:
+        need_external_clear = True
+
+    # ── 内部集合重建 ──────────────────────────────────────────
+    if need_internal_rebuild:
+        reason = "集合为空" if int_docs <= 0 else (
+            f"schema_version {int_stored_version} < {_CHROMA_SCHEMA_VERSION}"
         )
-        return
+        logger.warning(
+            f"⚠️ ChromaDB internal_docs 需重建: {reason}（当前 {int_docs} 条），"
+            f"将在 30s 后自动重建..."
+        )
 
-    reason = "集合为空" if docs <= 0 else (
-        f"schema_version {stored_version} < {_CHROMA_SCHEMA_VERSION}"
-    )
-    logger.warning(
-        f"⚠️ ChromaDB 需重建: {reason}（当前 {docs} 条），"
-        f"将在 30s 后自动重建..."
-    )
+        def _delayed_rebuild():
+            import time as _time
+            _time.sleep(30)
+            _run_bitable_build()
 
-    def _delayed_rebuild():
-        import time as _time
-        _time.sleep(30)  # 等 App 完全就绪后再构建
-        _run_bitable_build()
+        t = threading.Thread(target=_delayed_rebuild, daemon=True, name="auto-rebuild")
+        t.start()
+    else:
+        logger.info(
+            f"📊 ChromaDB internal_docs: {int_docs} 条, "
+            f"schema_version={int_stored_version}（已就绪）"
+        )
 
-    t = threading.Thread(target=_delayed_rebuild, daemon=True, name="auto-rebuild")
-    t.start()
+    # ── 外部集合清空 ──────────────────────────────────────────
+    if need_external_clear:
+        logger.warning(
+            f"⚠️ ChromaDB external_docs schema 升级: "
+            f"{ext_stored_version} → {_CHROMA_EXTERNAL_SCHEMA_VERSION}，"
+            f"清空 {ext_docs} 条旧数据（下次爬虫自动重填）..."
+        )
+        try:
+            from src.rag.vector_store import clear_collection
+            clear_collection(settings.chroma_collection_external)
+            # 写入新版 schema version
+            ext_coll = _get_collection(settings.chroma_collection_external)
+            ext_coll.modify(metadata={"schema_version": str(_CHROMA_EXTERNAL_SCHEMA_VERSION)})
+            logger.info("✅ external_docs 已清空并更新 schema version")
+        except Exception as e:
+            logger.error(f"清空 external_docs 失败: {e}")
+    elif ext_docs > 0:
+        logger.info(
+            f"📊 ChromaDB external_docs: {ext_docs} 条, "
+            f"schema_version={ext_stored_version}（已就绪）"
+        )
 
 
 @app.get("/admin/bitable-status", tags=["Admin"])

@@ -262,16 +262,28 @@ def news_to_chunks(
             chunk_id = hashlib.md5(
                 f"news_{company}_{topic}".encode()
             ).hexdigest()[:16]
+
+            # 收集新闻 URL（用于溯源链接）
+            news_urls: list[str] = []
+            for item in items:
+                url = item.get("url", "")
+                if url and url not in news_urls:
+                    news_urls.append(url)
+
+            metadata: dict[str, Any] = {
+                "source": "external_news",
+                "company": company,
+                "news_count": str(len(items)),
+                "topic": topic,
+                "data_type": "tech_news",
+            }
+            if news_urls:
+                metadata["url"] = news_urls[0]
+
             chunks.append({
                 "chunk_id": f"ext_news_{chunk_id}",
                 "content": doc,
-                "metadata": {
-                    "source": "external_news",
-                    "company": company,
-                    "news_count": str(len(items)),
-                    "topic": topic,
-                    "data_type": "tech_news",
-                },
+                "metadata": metadata,
             })
 
     return chunks

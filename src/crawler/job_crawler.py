@@ -399,15 +399,27 @@ def jobs_to_chunks(
         f"jobs_{company}_{doc_text[:100]}".encode()
     ).hexdigest()[:16]
 
+    # 收集职位 URL（用于溯源链接）
+    job_urls: list[str] = []
+    for job in jobs:
+        url = job.get("source_url", "") or job.get("url", "")
+        if url and url not in job_urls:
+            job_urls.append(url)
+
+    metadata: dict[str, Any] = {
+        "source": "external_jobs",
+        "company": company,
+        "job_count": str(len(jobs)),
+        "data_type": "recruitment",
+    }
+    if job_urls:
+        # 首个 URL 用于 _build_source_url() 生成可点击链接
+        metadata["url"] = job_urls[0]
+
     return [
         {
             "chunk_id": f"ext_jobs_{chunk_id}",
             "content": doc_text,
-            "metadata": {
-                "source": "external_jobs",
-                "company": company,
-                "job_count": str(len(jobs)),
-                "data_type": "recruitment",
-            },
+            "metadata": metadata,
         }
     ]
