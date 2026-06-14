@@ -52,18 +52,29 @@ async def generate_report(
     company = parsed.get("company", "未知客户")
     logger.info(f"开始生成报告: {company}")
 
-    # ── Phase 3：外部爬虫 fire-and-forget（后台触发，不等待）──────────
-    # 爬虫数据是「加分项」，不应阻塞报告生成主流程。
-    # 爬虫会在后台完成并将结果写入 ChromaDB，后续请求自动受益。
+    # ── Phase 3：启动外部爬虫（并行运行，等待完成后再生成报告主章节）──
+    # 爬虫数据对 Section 1/2 的质量至关重要（公司介绍、招聘分析等），
+    # 所以先启动爬虫、等待完成（最多 35s），再开始 RAG 检索和章节生成。
+    # 如果爬虫超时或失败，不影响后续流程 — 继续用已有数据生成。
+    from src.crawler.crawler_dispatcher import crawl_and_store
+    logger.info(f"Phase 3: 启动外部爬虫 → {company}")
+    crawl_task = asyncio.create_task(
+        asyncio.wait_for(crawl_and_store(company=company, timeout=35.0), timeout=40.0)
+    )
     try:
-        from src.crawler.crawler_dispatcher import crawl_and_store
-        logger.info(f"Phase 3: 后台触发外部爬虫 → {company}")
-        # fire-and-forget：创建后台任务，不 await
-        asyncio.create_task(
-            _fire_crawl(company)
-        )
+        crawl_result = await crawl_task
+        if crawl_result.get("chunks_stored", 0) > 0:
+            logger.info(
+                f"爬虫完成: {company} — "
+                f"{crawl_result.get('jobs_count', 0)} 职位, "
+                f"{crawl_result.get('chunks_stored', 0)} chunks"
+            )
+        else:
+            logger.info(f"爬虫完成: {company} — 无新增外部数据")
+    except asyncio.TimeoutError:
+        logger.warning(f"外部爬虫超时: {company}（继续使用已有数据生成报告）")
     except Exception as e:
-        logger.warning(f"外部爬虫后台触发异常（不影响报告生成）: {e}")
+        logger.warning(f"外部爬虫异常: {company} — {e}（继续使用已有数据生成报告）")
 
     # 准备模板变量
     template_vars = {
@@ -185,28 +196,6 @@ def _collect_sources(company: str) -> list[dict[str, str]]:
             continue
 
     return sources
-
-
-async def _fire_crawl(company: str) -> None:
-    """后台执行外部爬虫（fire-and-forget，异常静默处理）"""
-    try:
-        from src.crawler.crawler_dispatcher import crawl_and_store
-        result = await asyncio.wait_for(
-            crawl_and_store(company=company, timeout=35.0),
-            timeout=38.0,
-        )
-        if result.get("chunks_stored", 0) > 0:
-            logger.info(
-                f"后台爬虫完成: {company} — "
-                f"{result['jobs_count']} 职位, "
-                f"{result['chunks_stored']} chunks"
-            )
-        else:
-            logger.info(f"后台爬虫完成: {company} — 无新增数据")
-    except asyncio.TimeoutError:
-        logger.warning(f"后台爬虫超时: {company}")
-    except Exception as e:
-        logger.warning(f"后台爬虫异常: {company} — {e}")
 
 
 async def _generate_section(

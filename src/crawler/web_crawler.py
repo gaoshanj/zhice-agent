@@ -69,6 +69,15 @@ COMPANY_ALIASES: dict[str, list[str]] = {
     "蔚来": ["nio"],
     "小鹏": ["xpeng"],
     "理想汽车": ["lixiang", "li-auto"],
+    "友邦保险": ["aia"],
+    "友邦": ["aia"],
+}
+
+# 短英文公司名 → 已知官网域名（直接试探，不走搜索引擎）
+# 用于解决短英文名（如 AIA、IBM）搜索匹配度低的问题
+KNOWN_ENGLISH_DOMAINS: dict[str, str] = {
+    "aia": "www.aia.com",
+    "aia group": "www.aia.com",
 }
 
 
@@ -138,19 +147,72 @@ class WebCrawler(BaseCrawler):
 
     async def _find_website_url(self, company: str) -> str | None:
         """通过搜索引擎定位公司官网 URL"""
-        # 如果有 Bing API 优先使用
+        # 策略 0：已知短英文名 → 直接试探域名（最快，不走搜索）
+        company_lower = company.lower().strip()
+        if company_lower in KNOWN_ENGLISH_DOMAINS:
+            url = await self._try_known_domain(company_lower)
+            if url:
+                return url
+
+        # 策略 0.5：短英文名（纯 ASCII 且 ≤ 4 字符）→ 试探 .com 域名
+        if company.isascii() and len(company) <= 4:
+            url = await self._try_common_domains(company_lower)
+            if url:
+                return url
+
+        # 策略 1：通过 Bing API
         if settings.bing_search_api_key:
             url = await self._bing_api_find_website(company)
             if url:
                 return url
 
-        # 否则通过 Bing 搜索页面解析
+        # 策略 2：通过 Bing 搜索页面解析
         url = await self._bing_search_website(company)
         if url:
             return url
 
-        # 百度备用
+        # 策略 3：百度备用
         return await self._baidu_search_website(company)
+
+    async def _try_known_domain(self, company_lower: str) -> str | None:
+        """对已知短英文名直接试探已知域名"""
+        domain = KNOWN_ENGLISH_DOMAINS.get(company_lower)
+        if not domain:
+            return None
+        # 试探 https://{domain}
+        for scheme in ("https", "http"):
+            url = f"{scheme}://{domain}"
+            try:
+                async with httpx.AsyncClient(timeout=8) as client:
+                    resp = await client.get(url, headers=DEFAULT_HEADERS, follow_redirects=True)
+                    if resp.status_code < 500:
+                        logger.info(f"[官网爬虫] 已知域名命中: {url}")
+                        return url
+            except Exception:
+                continue
+        return None
+
+    async def _try_common_domains(self, company_lower: str) -> str | None:
+        """对短英文名试探常见域名后缀"""
+        candidates = [
+            f"www.{company_lower}.com",
+            f"www.{company_lower}.com.cn",
+            f"{company_lower}.com",
+            f"{company_lower}.com.cn",
+            f"{company_lower}.cn",
+        ]
+        for domain in candidates:
+            for scheme in ("https", "http"):
+                url = f"{scheme}://{domain}"
+                try:
+                    async with httpx.AsyncClient(timeout=8) as client:
+                        resp = await client.get(url, headers=DEFAULT_HEADERS, follow_redirects=True)
+                        if resp.status_code < 500:
+                            logger.info(f"[官网爬虫] 域名试探命中: {url}")
+                            return url
+                except Exception:
+                    continue
+        return None
 
     async def _bing_api_find_website(self, company: str) -> str | None:
         """使用 Bing Search API 找官网"""
