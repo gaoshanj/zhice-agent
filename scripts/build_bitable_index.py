@@ -71,13 +71,23 @@ def _get_tables() -> list[dict]:
             logger.error(f"FEISHU_BITABLE_TABLES 解析失败: {e}")
             logger.warning("回退到单表模式")
 
-    # 单表回退
-    if settings.feishu_bitable_base_token and settings.feishu_bitable_table_id:
-        logger.info("单表模式")
-        return [{
+    # 单表回退（自动包含爬虫结果表，确保多表数据都参与 RAG）
+    if settings.feishu_bitable_base_token:
+        tables = [{
             "base_token": settings.feishu_bitable_base_token,
             "table_id": settings.feishu_bitable_table_id,
         }]
+        # 如果配置了爬虫结果表且与主表不同，自动追加
+        crawl_id = settings.feishu_bitable_crawl_table_id
+        if crawl_id and crawl_id != settings.feishu_bitable_table_id:
+            tables.append({
+                "base_token": settings.feishu_bitable_base_token,
+                "table_id": crawl_id,
+            })
+        logger.info(f"单表模式（自动扩展为 {len(tables)} 个表）")
+        for t in tables:
+            logger.info(f"  - {t['table_id']}")
+        return tables
 
     raise RuntimeError("未配置任何 Bitable：请设置 FEISHU_BITABLE_TABLES 或 "
                        "FEISHU_BITABLE_BASE_TOKEN + FEISHU_BITABLE_TABLE_ID")
@@ -181,120 +191,119 @@ def fetch_records(token: str, base_token: str, table_id: str) -> list[dict]:
     return all_records
 
 
+# ── 多表字段映射 ──────────────────────────────────────────
+# 不同 Bitable 表的字段名不同，这里定义已知表的字段提取逻辑。
+# key=table_id, value={"company_field": str, "fields": [(label, field_name), ...]}
+_TABLE_SCHEMAS: dict[str, dict] = {
+    # 客户商机表
+    "tblHp4aCxwHDJXKJ": {
+        "company_field": "公司全称",
+        "fields": [
+            ("公司", "公司全称"), ("行业", "行业"), ("客户层级", "客户层级"),
+            ("客户需求", "客户需求"), ("培训部门", "培训部门"),
+            ("需求紧急程度", "需求紧急程度"), ("预计成交周期", "预计成交周期"),
+            ("下一步动作", "下一步关键动作"), ("交付风险点", "交付风险点"),
+            ("触发事件", "需求触发事件"), ("触发时间", "需求触发时间"),
+            ("商机来源", "商机来源"), ("最近培训", "最近一次培训内容"),
+            ("满意度", "最近一次整体满意度(100分满分)"),
+            ("负责人", "TPM/..."), ("编号", "编号"),
+        ],
+        "contact_fields": [
+            ("主要联系人姓名", "主要联系人角色", "影响力等级", "当前关系状态"),
+        ],
+        "extra_fields": ["厂商对接人", "客户ID", "最近一次覆盖人数"],
+    },
+    # 爬虫结果存储表
+    "tblnZiEhmSl6htGB": {
+        "company_field": "公司名",
+        "fields": [
+            ("公司", "公司名"), ("网址", "网址URL"), ("摘要", "摘要"),
+            ("抓取时间", "抓取时间"), ("来源类型", "来源类型"),
+        ],
+        "contact_fields": [],
+        "extra_fields": [],
+    },
+}
+
+
+def _get_company_name(fields: dict, table_id: str) -> str:
+    """从记录中提取公司名（兼容多表字段名）"""
+    schema = _TABLE_SCHEMAS.get(table_id, {})
+    company_field = schema.get("company_field", "公司全称")
+
+    val = fields.get(company_field)
+    if isinstance(val, list) and val:
+        return val[0].get("text", "") if isinstance(val[0], dict) else str(val[0])
+
+    # 该表无专用 company_field，尝试常见字段名
+    for key in ("公司全称", "公司名", "公司", "客户名称"):
+        val = fields.get(key)
+        if isinstance(val, list) and val:
+            return val[0].get("text", "") if isinstance(val[0], dict) else str(val[0])
+        if isinstance(val, str) and val:
+            return val
+    return ""
+
+
 def record_to_document(rec: dict, option_map: dict,
                        base_token: str = "", table_id: str = "") -> dict | None:
-    """将一条 Bitable 记录转为知识库文档"""
+    """将一条 Bitable 记录转为知识库文档（支持多表 schema）"""
     fields = rec.get("fields", {})
-    company = ""
-    parts = []
 
-    # 公司全称
-    company_val = fields.get("公司全称", [])
-    if isinstance(company_val, list) and company_val:
-        company = company_val[0].get("text", "") if isinstance(company_val[0], dict) else str(company_val[0])
-
+    company = _get_company_name(fields, table_id)
     if not company:
         return None
 
-    # 构建结构化文本
-    parts.append(f"【公司】{company}")
+    parts = []
+    schema = _TABLE_SCHEMAS.get(table_id)
 
-    # 行业
-    industry = resolve_value(fields.get("行业"), "行业", option_map)
-    if industry:
-        parts.append(f"【行业】{industry}")
+    if schema:
+        # ── 已知表：按预定义字段提取 ──
+        for label, field_name in schema["fields"]:
+            val = resolve_value(fields.get(field_name), field_name, option_map)
+            if val:
+                parts.append(f"【{label}】{val}")
 
-    # 客户层级
-    level = resolve_value(fields.get("客户层级"), "客户层级", option_map)
-    if level:
-        parts.append(f"【客户层级】{level}")
+        # 联系人字段
+        for contact_group in schema.get("contact_fields", []):
+            contact_parts = []
+            for fn in contact_group:
+                cf_val = fields.get(fn, "")
+                if isinstance(cf_val, str) and cf_val:
+                    contact_parts.append(cf_val)
+                elif isinstance(cf_val, list) and cf_val:
+                    txt = cf_val[0].get("text", "") if isinstance(cf_val[0], dict) else str(cf_val[0])
+                    if txt:
+                        contact_parts.append(txt)
+            if contact_parts:
+                parts.append(f"【联系人】{' / '.join(contact_parts)}")
 
-    # 客户需求
-    demand = resolve_value(fields.get("客户需求"), "客户需求", option_map)
-    if demand:
-        parts.append(f"【客户需求】{demand}")
+        # 额外字段
+        for fn in schema.get("extra_fields", []):
+            val = resolve_value(fields.get(fn), fn, option_map)
+            if val:
+                parts.append(f"【{fn}】{val}")
 
-    # 培训部门
-    dept = resolve_value(fields.get("培训部门"), "培训部门", option_map)
-    if dept:
-        parts.append(f"【培训部门】{dept}")
+        # 编号
+        record_id = fields.get("编号", "")
+        if record_id:
+            parts.append(f"【编号】{record_id}")
 
-    # 需求紧急程度
-    urgency = resolve_value(fields.get("需求紧急程度"), "需求紧急程度", option_map)
-    if urgency:
-        parts.append(f"【需求紧急程度】{urgency}")
-
-    # 预计成交周期
-    cycle = resolve_value(fields.get("预计成交周期"), "预计成交周期", option_map)
-    if cycle:
-        parts.append(f"【预计成交周期】{cycle}")
-
-    # 下一步关键动作
-    action = fields.get("下一步关键动作", "")
-    if action and isinstance(action, str):
-        parts.append(f"【下一步动作】{action}")
-
-    # 交付风险点
-    risk = resolve_value(fields.get("交付风险点"), "交付风险点", option_map)
-    if risk:
-        parts.append(f"【交付风险点】{risk}")
-
-    # 需求触发事件
-    trigger = resolve_value(fields.get("需求触发事件"), "需求触发事件", option_map)
-    if trigger:
-        parts.append(f"【触发事件】{trigger}")
-
-    # 需求触发时间
-    trigger_time = fields.get("需求触发时间")
-    if trigger_time:
-        parts.append(f"【触发时间】{resolve_value(trigger_time, '', option_map)}")
-
-    # 商机来源
-    source = resolve_value(fields.get("商机来源"), "商机来源", option_map)
-    if source:
-        parts.append(f"【商机来源】{source}")
-
-    # 培训内容
-    content = resolve_value(fields.get("最近一次培训内容"), "最近一次培训内容", option_map)
-    if content:
-        parts.append(f"【最近培训】{content}")
-
-    # 主要联系人
-    contact_name = fields.get("主要联系人姓名", "")
-    contact_role = resolve_value(fields.get("主要联系人角色"), "主要联系人角色", option_map)
-    contact_influence = resolve_value(fields.get("影响力等级"), "影响力等级", option_map)
-    contact_relation = resolve_value(fields.get("当前关系状态"), "当前关系状态", option_map)
-    if contact_name and isinstance(contact_name, str):
-        parts.append(f"【联系人】{contact_name}（{contact_role}，影响力{contact_influence}，关系{contact_relation}）")
-
-    # 满意度
-    satisfaction = resolve_value(fields.get("最近一次整体满意度(100分满分)"), "最近一次整体满意度(100分满分)", option_map)
-    if satisfaction:
-        coverage = fields.get("最近一次覆盖人数", "")
-        parts.append(f"【满意度】{satisfaction}，覆盖{coverage}人")
-
-    # TPM
-    tpm = resolve_value(fields.get("TPM/..."), "TPM/...", option_map)
-    if tpm:
-        parts.append(f"【负责人】{tpm}")
-
-    # 厂商对接人
-    vendor = fields.get("厂商对接人", [])
-    if isinstance(vendor, list) and vendor:
-        vendor_text = vendor[0].get("text", "") if isinstance(vendor[0], dict) else str(vendor[0])
-        if vendor_text:
-            parts.append(f"【厂商对接人】{vendor_text}")
-
-    # 编号
-    record_id = fields.get("编号", "")
-    if record_id:
-        parts.append(f"【编号】{record_id}")
-
-    # 客户ID
-    customer_id = ""
-    cid_val = fields.get("客户ID", [])
-    if isinstance(cid_val, list) and cid_val:
-        customer_id = cid_val[0].get("text", "") if isinstance(cid_val[0], dict) else str(cid_val[0])
+        # 客户ID
+        customer_id = ""
+        cid_val = fields.get("客户ID", [])
+        if isinstance(cid_val, list) and cid_val:
+            customer_id = cid_val[0].get("text", "") if isinstance(cid_val[0], dict) else str(cid_val[0])
+    else:
+        # ── 未知表：通用提取所有字段 ──
+        parts.append(f"【公司】{company}")
+        for key, value in fields.items():
+            if key in ("公司名", "公司全称", "公司"):
+                continue
+            val = resolve_value(value, key, option_map)
+            if val:
+                parts.append(f"【{key}】{val}")
+        customer_id = ""
 
     text = "\n".join(parts)
 
@@ -303,7 +312,7 @@ def record_to_document(rec: dict, option_map: dict,
         "title": company or "未知公司",
         "content": text,
         "company": company,
-        "customer_id": customer_id,
+        "customer_id": customer_id if schema else "",
         "record_id": fields.get("编号", ""),
         "source": "bitable",
         "url": f"https://bba12hub36.feishu.cn/base/{base_token}?table={table_id}",

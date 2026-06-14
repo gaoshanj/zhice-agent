@@ -152,7 +152,7 @@ def retrieve_for_report_with_meta(
 def format_rag_context(
     contexts: list[str] | list[dict[str, Any]],
     max_chars: int = 2500,
-) -> str:
+) -> tuple[str, dict[int, str]]:
     """将检索结果格式化为 Prompt 上下文
 
     Args:
@@ -160,10 +160,11 @@ def format_rag_context(
         max_chars: 截断上限（避免 Prompt 过长）
 
     Returns:
-        格式化后的上下文字符串（含来源标记 [来源1] [来源2] 等）
+        (formatted_text, source_map) — formatted_text 含来源标记 [来源1] [来源2]，
+        source_map 为 {cite_id: url} 供下游将 [来源N] 替换为超链接。
     """
     if not contexts:
-        return ""
+        return "", {}
 
     # 统一转为结构化 dict（兼容旧接口传 list[str]）
     structured: list[dict[str, Any]] = []
@@ -212,6 +213,7 @@ def format_rag_context(
             total += len(content)
 
     # 追加来源索引表（供 LLM 引用）
+    source_map: dict[int, str] = {}
     if any(c.get("source_url") for c in structured):
         parts.append("\n【来源索引】")
         for c in structured:
@@ -219,5 +221,6 @@ def format_rag_context(
             url = c.get("source_url", "")
             if cid and url:
                 parts.append(f"[来源{cid}] {c.get('title', '记录')} — {url}")
+                source_map[cid] = url
 
-    return "\n\n".join(parts)
+    return "\n\n".join(parts), source_map

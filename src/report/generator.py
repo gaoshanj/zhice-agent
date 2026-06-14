@@ -231,12 +231,12 @@ async def _generate_section(
         chat_completion, classify_llm_error, is_reasoning_model,
         REASONING_MIN_EFFECTIVE,
     )
-    from src.rag.retriever import retrieve_for_report, format_rag_context
+    from src.rag.retriever import retrieve_for_report_with_meta, format_rag_context
 
     t_start = time.monotonic()
     company = template_vars.get("company", "")
-    contexts = retrieve_for_report(company, section_num)
-    rag_context = format_rag_context(contexts)
+    contexts = retrieve_for_report_with_meta(company, section_num)
+    rag_context, source_map = format_rag_context(contexts)
 
     if rag_context:
         logger.info(f"第 {section_num} 节已注入 RAG 上下文（{len(contexts)} 条）")
@@ -269,6 +269,8 @@ async def _generate_section(
                 reasoning_effort=reasoning_effort,
             )
             if content and len(content.strip()) > 20:
+                # 后处理：将 [来源N] 替换为可点击的 Markdown 超链接
+                content = _linkify_sources(content, source_map)
                 elapsed = time.monotonic() - t_start
                 logger.info(
                     f"第 {section_num} 节 LLM 生成完成"
@@ -312,6 +314,28 @@ async def _generate_section(
     else:
         reason = "推理模型返回空内容（token 预算可能不足）"
     raise RuntimeError(f"第 {section_num} 节失败 — {reason}（已重试 {max_retries} 次）")
+
+
+def _linkify_sources(content: str, source_map: dict[int, str]) -> str:
+    """将报告内容中的 [来源N] 纯文本标记替换为 Markdown 超链接。
+
+    Args:
+        content: LLM 生成的报告文本
+        source_map: {cite_id: url}（来自 format_rag_context 返回值）
+
+    Returns:
+        替换后的文本，[来源1] → [来源1](url)
+    """
+    if not source_map:
+        return content
+
+    # 按 cite_id 降序替换，避免替换 [来源1] 时意外影响 [来源10]、[来源11] 等
+    for cid in sorted(source_map, reverse=True):
+        url = source_map[cid]
+        marker = f"[来源{cid}]"
+        replacement = f"[来源{cid}]({url})"
+        content = content.replace(marker, replacement)
+    return content
 
 
 def _truncate(text: str, max_len: int = 300) -> str:
