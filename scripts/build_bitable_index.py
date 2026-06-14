@@ -106,7 +106,12 @@ def get_app_token() -> str:
 
 
 def fetch_option_map(token: str, base_token: str, table_id: str) -> dict[str, dict[str, str]]:
-    """获取所有选择/多选字段的选项映射 {field_name: {option_id: label}}"""
+    """获取所有选择/多选/查找字段的选项映射 {field_name: {option_id: label}}
+
+    处理三种字段类型：
+    1. type=3 (SingleSelect) / type=4 (MultiSelect) — 直接读取 options
+    2. type=19 (Lookup) — 追踪到源表/源字段，读取其 options
+    """
     r = httpx.get(
         f"{BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/fields",
         headers={"Authorization": f"Bearer {token}"},
@@ -118,13 +123,80 @@ def fetch_option_map(token: str, base_token: str, table_id: str) -> dict[str, di
         raise RuntimeError(f"获取字段失败 (table={table_id}): {data}")
 
     option_map: dict[str, dict[str, str]] = {}
+    # 记录 Lookup 字段及其源引用；按源表缓存避免重复请求
+    lookup_fields: list[tuple[str, str, str]] = []  # [(field_name, target_table, target_field), ...]
+    fetched_tables: set[str] = set()
+
     for field in data["data"]["items"]:
-        if field["type"] in (3, 4):  # 3=单选, 4=多选
+        ftype = field["type"]
+        if ftype in (3, 4):  # 单选 / 多选
             name = field["field_name"]
-            props = field.get("property", {})
-            options = props.get("options", [])
+            options = field.get("property", {}).get("options", [])
             option_map[name] = {opt["id"]: opt["name"] for opt in options}
+
+        elif ftype == 19:  # Lookup 查找字段
+            name = field["field_name"]
+            prop = field.get("property", {})
+            target_table = prop.get("filter_info", {}).get("target_table", "")
+            target_field = prop.get("target_field", "")
+            if target_table and target_field:
+                lookup_fields.append((name, target_table, target_field))
+
+    # Pass 2: resolve Lookup field options from source tables
+    # Track: source_field_id → source_field_name for Lookup mapping
+    source_id_to_name: dict[str, str] = {}
+
+    for lookup_name, target_table, target_field in lookup_fields:
+        if target_table in fetched_tables:
+            continue  # already fetched, will be matched in Pass 3
+        fetched_tables.add(target_table)
+
+        try:
+            sr = httpx.get(
+                f"{BASE_URL}/bitable/v1/apps/{base_token}/tables/{target_table}/fields",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15,
+            )
+            sr.raise_for_status()
+            sf_data = sr.json()
+            if sf_data.get("code") != 0:
+                logger.warning(f"获取 Lookup 源表字段失败 (table={target_table}): {sf_data}")
+                continue
+
+            for sf in sf_data["data"]["items"]:
+                if sf["type"] in (3, 4):
+                    sf_name = sf["field_name"]
+                    sf_id = sf["field_id"]
+                    soptions = sf.get("property", {}).get("options", [])
+                    if soptions:
+                        option_map[sf_name] = {
+                            opt["id"]: opt["name"] for opt in soptions
+                        }
+                        source_id_to_name[sf_id] = sf_name
+        except Exception as e:
+            logger.warning(f"获取 Lookup 源表 {target_table} 字段失败: {e}")
+
+    # Pass 3: map Lookup field names to their source field's options
+    for lookup_name, _target_table, target_field in lookup_fields:
+        if lookup_name in option_map:
+            continue  # already has options (unlikely for Lookup, but safe)
+        src_name = source_id_to_name.get(target_field)
+        if src_name and src_name in option_map:
+            option_map[lookup_name] = option_map[src_name]
+
     return option_map
+
+
+def _find_option_in_map(option_id: str, option_map: dict[str, dict[str, str]]) -> str | None:
+    """在所有字段的 option_map 中搜索 option_id，返回显示名或 None
+
+    用于处理 Lookup（type=19）和 Formula 字段 —
+    这些字段返回的是引用字段的 option_id，但不在本字段的映射中。
+    """
+    for fopts in option_map.values():
+        if option_id in fopts:
+            return fopts[option_id]
+    return None
 
 
 def resolve_value(value: object, field_name: str, option_map: dict) -> str:
@@ -141,10 +213,16 @@ def resolve_value(value: object, field_name: str, option_map: dict) -> str:
             else:
                 parts.append(str(item))
         # 如果是选项 ID 数组，尝试解析
+        # 情况1: 本字段是 select/multi-select，option_map 中有直接映射
+        # 情况2: Lookup/Formula 字段返回 option_id，需在所有字段中搜索
         resolved = []
         for p in parts:
             if field_name in option_map and p in option_map[field_name]:
                 resolved.append(option_map[field_name][p])
+            elif p.startswith("opt"):
+                # Lookup（type=19）/ Formula 等字段返回的 option_id
+                match = _find_option_in_map(p, option_map)
+                resolved.append(match if match else p)
             else:
                 resolved.append(p)
         return "、".join(resolved) if resolved else ""
