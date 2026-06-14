@@ -177,8 +177,8 @@ async def _handle_user_message(chat_id: str, msg_id: str, content: str):
             f"✅ 已收到【{company}】的生成请求，正在调用 AI 生成报告，预计需要 2-3 分钟，请稍候..."
         )
 
-        # Step 3: 生成报告
-        report_data = await generate_report(parsed)
+        # Step 3: 生成报告（reasoning_effort="low" 以加速生成，约2.1x）
+        report_data = await generate_report(parsed, reasoning_effort="low")
 
         # Step 4: 构建并推送飞书卡片
         card_json = build_report_card(report_data)
