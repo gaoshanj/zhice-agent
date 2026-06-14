@@ -7,6 +7,7 @@ sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
 
 import asyncio
 import os
+import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -44,6 +45,12 @@ async def lifespan(app: FastAPI):
     logger.info(f"   OAuth 用户授权: {'已配置' if settings.feishu_user_refresh_token else '未配置'}")
     logger.info(f"   ChromaDB: {settings.chroma_persist_dir}")
     logger.info("=" * 60)
+
+    # ── 启动时自动检测并重建 Bitable RAG 索引 ──
+    # 每次部署后 ChromaDB 内存状态清空，需要重新构建。
+    # 延迟 30s 执行，确保 Azure App Service 完全就绪。
+    _auto_build_on_startup()
+
     yield
     logger.info("培训智策 Agent 已停止")
 
@@ -211,6 +218,9 @@ _bitable_build_state: dict[str, Any] = {
     "doc_count": 0,
 }
 
+# 构建锁：防止并发运行多个 build_index
+_build_lock = threading.Lock()
+
 # ─── 批量爬取状态追踪 ──────────────────────────────────────
 _batch_crawl_state: dict[str, Any] = {
     "status": "idle",  # idle | running | completed | failed
@@ -229,41 +239,78 @@ def _run_bitable_build():
     避免 async/await + run_in_executor 双层调度带来的
     启动延迟或静默失败风险。
     """
-    # state 已在调用方设为 building，这里只更新 started_at
-    _bitable_build_state["started_at"] = datetime.now(timezone.utc).isoformat()
-    _bitable_build_state["error"] = None
-    _bitable_build_state["doc_count"] = 0
-
-    logger.info("🔄 Bitable 索引构建开始...")
-    logger.info(f"   ChromaDB 持久化目录: {settings.chroma_persist_dir}")
-    logger.info(f"   Bitable Base: {settings.feishu_bitable_base_token[:8]}...")
-    logger.info(f"   Table ID: {settings.feishu_bitable_table_id}")
-
-    # 导入脚本（可能失败，提前捕获）
-    try:
-        from scripts.build_bitable_index import build_index
-    except BaseException as e:
-        _bitable_build_state["status"] = "failed"
-        _bitable_build_state["error"] = f"导入失败 {type(e).__name__}: {str(e)[:800]}"
-        _bitable_build_state["finished_at"] = datetime.now(timezone.utc).isoformat()
-        logger.error(f"❌ build_bitable_index 导入失败: {e}", exc_info=True)
+    # 并发保护：只允许一个构建任务运行
+    if not _build_lock.acquire(blocking=False):
+        logger.warning("⚠️ 已有索引构建任务运行中，跳过本次构建")
         return
 
-    start = time.time()
     try:
-        build_index(True)
-        elapsed = time.time() - start
-        doc_count = collection_count()
-        _bitable_build_state["status"] = "success"
-        _bitable_build_state["doc_count"] = doc_count
-        logger.info(f"✅ Bitable 索引构建完成（耗时 {elapsed:.1f}s，共 {doc_count} 条）")
-    except BaseException as e:
-        elapsed = time.time() - start
-        _bitable_build_state["status"] = "failed"
-        _bitable_build_state["error"] = f"{type(e).__name__}: {str(e)[:800]}"
-        logger.error(f"❌ Bitable 索引构建失败（耗时 {elapsed:.1f}s）: {e}", exc_info=True)
+        # state 已在调用方设为 building，这里只更新 started_at
+        _bitable_build_state["started_at"] = datetime.now(timezone.utc).isoformat()
+        _bitable_build_state["error"] = None
+        _bitable_build_state["doc_count"] = 0
+
+        logger.info("🔄 Bitable 索引构建开始...")
+        logger.info(f"   ChromaDB 持久化目录: {settings.chroma_persist_dir}")
+        logger.info(f"   Bitable Base: {settings.feishu_bitable_base_token[:8]}...")
+        logger.info(f"   Table ID: {settings.feishu_bitable_table_id}")
+
+        # 导入脚本（可能失败，提前捕获）
+        try:
+            from scripts.build_bitable_index import build_index
+        except BaseException as e:
+            _bitable_build_state["status"] = "failed"
+            _bitable_build_state["error"] = f"导入失败 {type(e).__name__}: {str(e)[:800]}"
+            _bitable_build_state["finished_at"] = datetime.now(timezone.utc).isoformat()
+            logger.error(f"❌ build_bitable_index 导入失败: {e}", exc_info=True)
+            return
+
+        start = time.time()
+        try:
+            build_index(True)
+            elapsed = time.time() - start
+            doc_count = collection_count()
+            _bitable_build_state["status"] = "success"
+            _bitable_build_state["doc_count"] = doc_count
+            logger.info(f"✅ Bitable 索引构建完成（耗时 {elapsed:.1f}s，共 {doc_count} 条）")
+        except BaseException as e:
+            elapsed = time.time() - start
+            _bitable_build_state["status"] = "failed"
+            _bitable_build_state["error"] = f"{type(e).__name__}: {str(e)[:800]}"
+            logger.error(f"❌ Bitable 索引构建失败（耗时 {elapsed:.1f}s）: {e}", exc_info=True)
     finally:
         _bitable_build_state["finished_at"] = datetime.now(timezone.utc).isoformat()
+        _build_lock.release()
+
+
+def _auto_build_on_startup():
+    """启动时检查 ChromaDB 是否为空，若为空则延迟 30s 自动重建索引。
+
+    这个函数解决了 Azure App Service 每次 CI/CD 部署后 ChromaDB
+    内存状态清空的问题。不再依赖 ci.yml 的外部协调——
+    App 启动后自己检测并修复。
+    """
+    try:
+        docs = _chroma_status()
+    except Exception:
+        docs = -1
+
+    if docs > 0:
+        logger.info(f"📊 ChromaDB internal_docs: {docs} 条（已就绪，跳过自动重建）")
+        return
+
+    logger.warning(
+        f"⚠️ ChromaDB internal_docs 为空（当前 {docs} 条），"
+        f"将在 30s 后自动重建索引..."
+    )
+
+    def _delayed_rebuild():
+        import time as _time
+        _time.sleep(30)  # 等 App 完全就绪后再构建
+        _run_bitable_build()
+
+    t = threading.Thread(target=_delayed_rebuild, daemon=True, name="auto-rebuild")
+    t.start()
 
 
 @app.get("/admin/bitable-status", tags=["Admin"])
