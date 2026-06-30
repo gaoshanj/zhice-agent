@@ -17,9 +17,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import time
+import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -399,53 +401,80 @@ def record_to_document(rec: dict, option_map: dict,
 
 # ── 主流程 ──────────────────────────────────────────────
 
-def build_index(rebuild: bool = False) -> None:
-    """构建 Bitable 知识库索引（支持多表）"""
+def build_index(rebuild: bool = False,
+                table_filter: str = "") -> None:
+    """构建 Bitable 知识库索引（支持多表）
+
+    Args:
+        rebuild:      是否清空现有集合后重建
+        table_filter: 可选，只处理 table_id 包含此字符串的表（用于单独重建外部表）
+    """
     tables = _get_tables()
+
+    # 按 table_id 决定目标集合
+    #   tblHp4aCxwHDJXKJ（客户商机） → internal_docs
+    #   tblnZiEhmSl6htGB（网络信息抓取表） → external_docs
+    internal_tables = [t for t in tables
+                        if t["table_id"] != "tblnZiEhmSl6htGB"]
+    external_tables = [t for t in tables
+                        if t["table_id"] == "tblnZiEhmSl6htGB"]
+
+    if table_filter:
+        # 单独重建模式：只处理匹配的表
+        internal_tables = [t for t in internal_tables
+                            if table_filter in t["table_id"]]
+        external_tables = [t for t in external_tables
+                            if table_filter in t["table_id"]]
+        if not internal_tables and not external_tables:
+            logger.warning(f"table_filter='{table_filter}' 未匹配任何表，退出")
+            return
 
     if rebuild:
         logger.warning("Rebuild 模式：清空现有集合并重建")
-        try:
-            clear_collection(settings.chroma_collection_internal)
-        except Exception as e:
-            logger.warning(f"清空集合失败（如首次构建则正常）: {e}")
+        colls_to_clear = set()
+        if internal_tables:
+            colls_to_clear.add(settings.chroma_collection_internal)
+        if external_tables:
+            colls_to_clear.add(settings.chroma_collection_external)
+        for coll in colls_to_clear:
+            try:
+                clear_collection(coll)
+                logger.info(f"  ✅ 集合已清空: {coll}")
+            except Exception as e:
+                logger.warning(f"  清空集合 {coll} 失败（如首次构建则正常）: {e}")
 
     token = get_app_token()
 
-    total_records = 0
-    total_docs = 0
-    total_chunks = 0
+    total_records  = 0
+    total_docs    = 0
+    total_chunks  = 0
 
-    for i, table_cfg in enumerate(tables):
+    # ── 处理内部表 → internal_docs ──────────────────────────────
+    for i, table_cfg in enumerate(internal_tables):
         base_token = table_cfg["base_token"]
-        table_id = table_cfg["table_id"]
-        label = table_cfg.get("label", table_id[:12])
+        table_id   = table_cfg["table_id"]
+        label      = table_cfg.get("label", table_id[:12])
+        collection_name = settings.chroma_collection_internal
 
         logger.info(f"\n{'='*50}")
-        logger.info(f"[{i+1}/{len(tables)}] 处理表格: {label}")
-        logger.info(f"  base_token: {base_token[:12]}..., table_id: {table_id}")
+        logger.info(f"[内部 {i+1}/{len(internal_tables)}] 处理表格: {label}")
+        logger.info(f"  table_id: {table_id}")
+        logger.info(f"  目标集合: {collection_name}")
         logger.info(f"{'='*50}")
 
-        # 获取字段映射
-        logger.info("  获取字段选项映射...")
         option_map = fetch_option_map(token, base_token, table_id)
-
-        # 拉取数据
-        logger.info("  拉取表格数据...")
         records = fetch_records(token, base_token, table_id)
         logger.info(f"  拉取完成：{len(records)} 条记录")
         total_records += len(records)
 
-        # 转文档
         documents = []
-        skipped = 0
+        skipped   = 0
         for rec in records:
             doc = record_to_document(rec, option_map, base_token, table_id)
             if doc:
                 documents.append(doc)
             else:
                 skipped += 1
-
         logger.info(f"  有效文档：{len(documents)} 条（跳过 {skipped} 条无公司名记录）")
         total_docs += len(documents)
 
@@ -453,40 +482,93 @@ def build_index(rebuild: bool = False) -> None:
             logger.warning(f"  表格 {label} 无有效文档，跳过")
             continue
 
-        # 分块
         chunks = []
         for doc in documents:
             chunks.append({
                 "chunk_id": f"bitable::{doc['node_token']}",
-                "content": doc["content"],
+                "content":  doc["content"],
                 "metadata": {
-                    "title": doc["title"],
-                    "source": "bitable",
-                    "base_token": base_token,
-                    "table_id": table_id,
-                    "customer_id": doc.get("customer_id", ""),
-                    "record_id": doc.get("record_id", ""),
+                    "title":        doc["title"],
+                    "source":       "bitable",
+                    "base_token":   base_token,
+                    "table_id":     table_id,
+                    "customer_id":  doc.get("customer_id", ""),
+                    "record_id":    doc.get("record_id", ""),
                 },
             })
 
-        # 写入向量库
         logger.info(f"  生成 embedding 并写入向量库（{len(chunks)} chunks）...")
-        start = time.time()
-        count = add_chunks(chunks, collection_name=settings.chroma_collection_internal)
+        start  = time.time()
+        count = add_chunks(chunks, collection_name=collection_name)
         elapsed = time.time() - start
         logger.info(f"  写入完成：{count} 条（耗时 {elapsed:.1f}s）")
         total_chunks += count
 
-    # 最终验证
-    final = collection_count()
+    # ── 处理外部表 → external_docs ──────────────────────────────
+    for i, table_cfg in enumerate(external_tables):
+        base_token = table_cfg["base_token"]
+        table_id   = table_cfg["table_id"]
+        label      = table_cfg.get("label", table_id[:12])
+        collection_name = settings.chroma_collection_external
+
+        logger.info(f"\n{'='*50}")
+        logger.info(f"[外部 {i+1}/{len(external_tables)}] 处理表格: {label}")
+        logger.info(f"  table_id: {table_id}")
+        logger.info(f"  目标集合: {collection_name}")
+        logger.info(f"{'='*50}")
+
+        option_map = fetch_option_map(token, base_token, table_id)
+        records = fetch_records(token, base_token, table_id)
+        logger.info(f"  拉取完成：{len(records)} 条记录")
+        total_records += len(records)
+
+        documents = []
+        skipped   = 0
+        for rec in records:
+            doc = record_to_document(rec, option_map, base_token, table_id)
+            if doc:
+                documents.append(doc)
+            else:
+                skipped += 1
+        logger.info(f"  有效文档：{len(documents)} 条（跳过 {skipped} 条无公司名记录）")
+        total_docs += len(documents)
+
+        if not documents:
+            logger.warning(f"  表格 {label} 无有效文档，跳过")
+            continue
+
+        chunks = []
+        for doc in documents:
+            # node_token = record_id（来自 record_to_document，天然唯一）
+            chunks.append({
+                "chunk_id": doc["node_token"],
+                "content":  doc["content"],
+                "metadata": {
+                    "title":       doc["title"],
+                    "source":      "external",
+                    "base_token":  base_token,
+                    "table_id":    table_id,
+                    "company":      doc.get("company", ""),
+                    "data_type":    "bitable_crawl",
+                },
+            })
+
+        logger.info(f"  生成 embedding 并写入向量库（{len(chunks)} chunks）...")
+        start  = time.time()
+        count = add_chunks(chunks, collection_name=collection_name)
+        elapsed = time.time() - start
+        logger.info(f"  写入完成：{count} 条（耗时 {elapsed:.1f}s）")
+        total_chunks += count
+
+    # ── 最终验证 ─────────────────────────────────────────────
+    final_internal = collection_count(collection_name=settings.chroma_collection_internal)
+    final_external = collection_count(collection_name=settings.chroma_collection_external)
     logger.info(f"\n{'='*50}")
-    logger.info(f"🎉 所有表格索引构建完成！")
+    logger.info(f"✅ 所有表格索引构建完成！")
     logger.info(f"  总记录: {total_records} | 总文档: {total_docs} | 总 chunks: {total_chunks}")
-    logger.info(f"  集合 '{settings.chroma_collection_internal}' 当前共 {final} 条记录")
+    logger.info(f"  集合 'internal_docs' 当前共 {final_internal} 条")
+    logger.info(f"  集合 'external_docs' 当前共 {final_external} 条")
     logger.info(f"{'='*50}")
-
-
-import uuid
 
 
 def main():

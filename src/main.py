@@ -102,17 +102,22 @@ async def health():
         "bitable_configured": bool(settings.feishu_bitable_base_token or settings.feishu_bitable_tables),
         "oauth_configured": bool(settings.feishu_user_refresh_token),
         "embedding_configured": bool(settings.azure_embedding_deployment),
-        "chroma_docs": _chroma_status(),
-        "chroma_persist_dir": settings.chroma_persist_dir,
+        "chroma_docs":          _chroma_status(),
+        "chroma_docs_external": _chroma_status(collection_name=settings.chroma_collection_external),
+        "chroma_persist_dir":  settings.chroma_persist_dir,
         "bitable_build_state": _bitable_build_state.get("status"),
     }
 
 
-def _chroma_status() -> int:
-    """获取 ChromaDB 文档数（安全获取，不抛异常）"""
+def _chroma_status(collection_name: str = "") -> int:
+    """获取 ChromaDB 文档数（安全获取，不抛异常）
+
+    Args:
+        collection_name: 集合名称，空字符串表示默认（internal_docs）
+    """
     try:
         from src.rag.vector_store import collection_count
-        return collection_count()
+        return collection_count(collection_name=collection_name)
     except Exception:
         return -1
 
@@ -456,91 +461,20 @@ async def rebuild_external_index(
 
 
 def _run_external_build() -> None:
-    """后台执行 external_docs 重建"""
+    """后台执行 external_docs 重建（委托给 build_bitable_index）"""
     import time
     start = time.time()
     try:
-        from src.rag.vector_store import add_chunks, clear_collection, collection_count as ext_count
-        import httpx, hashlib, json
-        from typing import Any
-
-        BASE_URL   = "https://open.feishu.cn/open-apis"
-        BASE_TOKEN = settings.feishu_bitable_base_token or "CeitbAhJGaHqD1s1EricZp9intf"
-        TABLE_ID   = settings.feishu_bitable_crawl_table_id  or "tblnZiEhmSl6htGB"
-
-        # 获取 token
-        r = httpx.post(
-            f"{BASE_URL}/auth/v3/tenant_access_token/internal",
-            json={"app_id": settings.feishu_app_id, "app_secret": settings.feishu_app_secret},
-            timeout=10,
-        )
-        r.raise_for_status()
-        token = r.json()["tenant_access_token"]
-        hdr = {"Authorization": f"Bearer {token}"}
-
-        # 清空 external_docs
-        clear_collection(settings.chroma_collection_external)
-        logger.info("✅ external_docs 已清空")
-
-        # 读取所有记录
-        all_records = []
-        page_token = None
-        while True:
-            params = {"page_size": 100}
-            if page_token:
-                params["page_token"] = page_token
-            resp = httpx.get(
-                f"{BASE_URL}/bitable/v1/apps/{BASE_TOKEN}/tables/{TABLE_ID}/records",
-                params=params, headers=hdr, timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json().get("data", {})
-            items = data.get("items", [])
-            for item in items:
-                record_id  = item.get("record_id", "")
-                fields     = item.get("fields", {})
-                company    = fields.get("公司名") or ""
-                source_type = fields.get("来源类型") or ""
-                text       = (fields.get("文本") or "") or (fields.get("摘要") or "")
-                url        = fields.get("URL") or ""
-
-                if not text or not company:
-                    continue
-
-                # 用飞书 record_id 作为 chunk_id（天然唯一），fallback 到 MD5
-                chunk_id = record_id or hashlib.md5(
-                    f"external_{company}_{source_type}_{text[:100]}".encode()
-                ).hexdigest()[:16]
-                metadata = {
-                    "source":    f"external_{source_type}",
-                    "company":   company,
-                    "data_type": source_type,
-                }
-                if url:
-                    metadata["url"] = url
-                all_records.append({
-                    "chunk_id":  chunk_id,
-                    "content":   text,
-                    "metadata": metadata,
-                })
-
-            if not data.get("has_more"):
-                break
-            page_token = data.get("page_token")
-
-        logger.info(f"📥 从飞书读取 {len(all_records)} 条外部数据")
-
-        # 写入 external_docs
-        if all_records:
-            add_chunks(all_records, collection_name=settings.chroma_collection_external)
-
-        total  = ext_count(collection_name=settings.chroma_collection_external)
+        from scripts.build_bitable_index import build_index
+        logger.info("📥 开始重建 external_docs（仅外部表）...")
+        build_index(rebuild=True, table_filter="tblnZiEhmSl6htGB")
         elapsed = time.time() - start
+        from src.rag.vector_store import collection_count
+        total = collection_count(collection_name=settings.chroma_collection_external)
         _external_build_state["status"]      = "success"
         _external_build_state["doc_count"]    = total
-        _external_build_state["record_count"] = len(all_records)
         _external_build_state["finished_at"]  = datetime.now(timezone.utc).isoformat()
-        logger.info(f"✅ external_docs 重建完成：{total} 个文档，{len(all_records)} 条记录，耗时 {elapsed:.1f}s")
+        logger.info(f"✅ external_docs 重建完成：{total} 条（耗时 {elapsed:.1f}s）")
     except BaseException as e:
         elapsed = time.time() - start
         _external_build_state["status"] = "failed"
