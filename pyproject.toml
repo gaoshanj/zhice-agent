@@ -1,6 +1,6 @@
 [project]
 name = "zhice-agent"
-version = "0.1.0"
+version = "0.1.1"  # 招聘数据入库（179条智联招聘AI/IT职位）
 description = "培训智策 Agent — 基于飞书机器人 + RAG + LLM 的销售策略报告系统"
 requires-python = ">=3.11"
 dependencies = [
