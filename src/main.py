@@ -466,7 +466,7 @@ def _run_external_build() -> None:
 
         BASE_URL   = "https://open.feishu.cn/open-apis"
         BASE_TOKEN = settings.feishu_bitable_base_token or "CeitbAhJGaHqD1s1EricZp9intf"
-        TABLE_ID   = settings.feishu_crawl_table_id  or "tblnZiEhmSl6htGB"
+        TABLE_ID   = settings.feishu_bitable_crawl_table_id  or "tblnZiEhmSl6htGB"
 
         # 获取 token
         r = httpx.post(
