@@ -70,3 +70,5 @@ test-results/
 # Data exports (sensitive tokens & local data)
 data/
 test_*.json
+chroma_data_backup/
+chroma_data_backup_*/

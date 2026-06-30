@@ -425,6 +425,139 @@ async def bitable_build_status(secret: str = Query(..., description="验证密�
     }
 
 
+# ─── External Docs 重建端点 ──────────────────────────────────
+
+_external_build_state: dict[str, Any] = {"status": "idle"}
+
+
+@app.post("/admin/rebuild-external-index", tags=["Admin"])
+async def rebuild_external_index(
+    secret: str = Query(..., description="验证密钥"),
+    background_tasks: BackgroundTasks = None,
+):
+    """从飞书网络信息抓取表重建 external_docs 索引（受密钥保护）
+
+    读取 tblnZiEhmSl6htGB 表中的爬虫数据 → 转 chunk → 写入 ChromaDB external_docs 集合。
+    """
+    if not settings.rebuild_index_secret:
+        raise HTTPException(status_code=501, detail="管理员未配置 REBUILD_INDEX_SECRET")
+    if secret != settings.rebuild_index_secret:
+        raise HTTPException(status_code=403, detail="密钥错误")
+
+    logger.info("📥 收到 external_docs 重建请求")
+
+    _external_build_state["status"] = "building"
+    _external_build_state["started_at"] = datetime.now(timezone.utc).isoformat()
+    background_tasks.add_task(_run_external_build)
+    return JSONResponse(
+        status_code=202,
+        content={"status": "accepted", "message": "开始重建 external_docs 索引（后台任务）"},
+    )
+
+
+def _run_external_build() -> None:
+    """后台执行 external_docs 重建"""
+    import time
+    start = time.time()
+    try:
+        from src.rag.vector_store import add_chunks, clear_collection, collection_count as ext_count
+        from src.config import settings as cfg
+        import httpx, hashlib, json
+        from typing import Any
+
+        BASE_URL = "https://open.feishu.cn/open-apis"
+        BASE_TOKEN = cfg.feishu_bitable_base_token or "CeitbAhJGaHqD1s1EricZp9intf"
+        TABLE_ID = "tblnZiEhmSl6htGB"
+
+        # 获取 token
+        r = httpx.post(f"{BASE_URL}/auth/v3/tenant_access_token/internal",
+            json={"app_id": cfg.feishu_app_id, "app_secret": cfg.feishu_app_secret}, timeout=10)
+        token = r.json()["tenant_access_token"]
+        hdr = {"Authorization": f"Bearer {token}"}
+
+        # 清空 external_docs
+        clear_collection(cfg.chroma_collection_external)
+        logger.info("✅ external_docs 已清空")
+
+        # 读取所有记录
+        all_records = []
+        page_token = None
+        while True:
+            params = {"page_size": 100}
+            if page_token:
+                params["page_token"] = page_token
+            resp = httpx.get(
+                f"{BASE_URL}/bitable/v1/apps/{BASE_TOKEN}/tables/{TABLE_ID}/records",
+                params=params, headers=hdr, timeout=30)
+            data = resp.json().get("data", {})
+            items = data.get("items", [])
+            for item in items:
+                fields = item.get("fields", {})
+                company = fields.get("公司名") or ""
+                source_type = fields.get("来源类型") or ""
+                text = (fields.get("文本") or "") or (fields.get("摘要") or "")
+                url = fields.get("URL") or ""
+
+                if not text or not company:
+                    continue
+
+                chunk_id = hashlib.md5(
+                    f"external_{company}_{source_type}_{text[:100]}".encode()
+                ).hexdigest()[:16]
+                metadata = {
+                    "source": f"external_{source_type}",
+                    "company": company,
+                    "data_type": source_type,
+                }
+                if url:
+                    metadata["url"] = url
+                all_records.append({
+                    "chunk_id": chunk_id,
+                    "content": text,
+                    "metadata": metadata,
+                })
+
+            if not data.get("has_more"):
+                break
+            page_token = data.get("page_token")
+
+        logger.info(f"📥 从飞书读取 {len(all_records)} 条外部数据")
+
+        # 写入 external_docs
+        if all_records:
+            add_chunks(all_records, collection_name=cfg.chroma_collection_external)
+
+        total = ext_count(collection_name=cfg.chroma_collection_external)
+        elapsed = time.time() - start
+        _external_build_state["status"] = "success"
+        _external_build_state["doc_count"] = total
+        _external_build_state["record_count"] = len(all_records)
+        _external_build_state["finished_at"] = datetime.now(timezone.utc).isoformat()
+        logger.info(f"✅ external_docs 重建完成：{total} 个文档，{len(all_records)} 条记录，耗时 {elapsed:.1f}s")
+    except BaseException as e:
+        elapsed = time.time() - start
+        _external_build_state["status"] = "failed"
+        _external_build_state["error"] = f"{type(e).__name__}: {str(e)[:800]}"
+        _external_build_state["finished_at"] = datetime.now(timezone.utc).isoformat()
+        logger.error(f"❌ external_docs 重建失败（{elapsed:.1f}s）: {e}", exc_info=True)
+
+
+@app.get("/admin/external-status", tags=["Admin"])
+async def external_build_status(secret: str = Query(...)):
+    """查询 external_docs 重建状态"""
+    if not settings.rebuild_index_secret:
+        raise HTTPException(status_code=501, detail="管理员未配置 REBUILD_INDEX_SECRET")
+    if secret != settings.rebuild_index_secret:
+        raise HTTPException(status_code=403, detail="密钥错误")
+    try:
+        from src.rag.vector_store import collection_count as ext_count
+        from src.config import settings as cfg
+        ext_docs = ext_count(collection_name=cfg.chroma_collection_external)
+    except BaseException:
+        ext_docs = -1
+    return {**_external_build_state, "external_docs": ext_docs}
+
+
 # ─── OAuth 授权端点 ──────────────────────────────────────────
 
 
