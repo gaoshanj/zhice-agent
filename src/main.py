@@ -461,22 +461,25 @@ def _run_external_build() -> None:
     start = time.time()
     try:
         from src.rag.vector_store import add_chunks, clear_collection, collection_count as ext_count
-        from src.config import settings as cfg
         import httpx, hashlib, json
         from typing import Any
 
-        BASE_URL = "https://open.feishu.cn/open-apis"
-        BASE_TOKEN = cfg.feishu_bitable_base_token or "CeitbAhJGaHqD1s1EricZp9intf"
-        TABLE_ID = "tblnZiEhmSl6htGB"
+        BASE_URL   = "https://open.feishu.cn/open-apis"
+        BASE_TOKEN = settings.feishu_bitable_base_token or "CeitbAhJGaHqD1s1EricZp9intf"
+        TABLE_ID   = settings.feishu_crawl_table_id  or "tblnZiEhmSl6htGB"
 
         # 获取 token
-        r = httpx.post(f"{BASE_URL}/auth/v3/tenant_access_token/internal",
-            json={"app_id": cfg.feishu_app_id, "app_secret": cfg.feishu_app_secret}, timeout=10)
+        r = httpx.post(
+            f"{BASE_URL}/auth/v3/tenant_access_token/internal",
+            json={"app_id": settings.feishu_app_id, "app_secret": settings.feishu_app_secret},
+            timeout=10,
+        )
+        r.raise_for_status()
         token = r.json()["tenant_access_token"]
         hdr = {"Authorization": f"Bearer {token}"}
 
         # 清空 external_docs
-        clear_collection(cfg.chroma_collection_external)
+        clear_collection(settings.chroma_collection_external)
         logger.info("✅ external_docs 已清空")
 
         # 读取所有记录
@@ -488,15 +491,17 @@ def _run_external_build() -> None:
                 params["page_token"] = page_token
             resp = httpx.get(
                 f"{BASE_URL}/bitable/v1/apps/{BASE_TOKEN}/tables/{TABLE_ID}/records",
-                params=params, headers=hdr, timeout=30)
+                params=params, headers=hdr, timeout=30,
+            )
+            resp.raise_for_status()
             data = resp.json().get("data", {})
             items = data.get("items", [])
             for item in items:
                 fields = item.get("fields", {})
-                company = fields.get("公司名") or ""
+                company    = fields.get("公司名") or ""
                 source_type = fields.get("来源类型") or ""
-                text = (fields.get("文本") or "") or (fields.get("摘要") or "")
-                url = fields.get("URL") or ""
+                text       = (fields.get("文本") or "") or (fields.get("摘要") or "")
+                url        = fields.get("URL") or ""
 
                 if not text or not company:
                     continue
@@ -505,15 +510,15 @@ def _run_external_build() -> None:
                     f"external_{company}_{source_type}_{text[:100]}".encode()
                 ).hexdigest()[:16]
                 metadata = {
-                    "source": f"external_{source_type}",
-                    "company": company,
+                    "source":    f"external_{source_type}",
+                    "company":   company,
                     "data_type": source_type,
                 }
                 if url:
                     metadata["url"] = url
                 all_records.append({
-                    "chunk_id": chunk_id,
-                    "content": text,
+                    "chunk_id":  chunk_id,
+                    "content":   text,
                     "metadata": metadata,
                 })
 
@@ -525,14 +530,14 @@ def _run_external_build() -> None:
 
         # 写入 external_docs
         if all_records:
-            add_chunks(all_records, collection_name=cfg.chroma_collection_external)
+            add_chunks(all_records, collection_name=settings.chroma_collection_external)
 
-        total = ext_count(collection_name=cfg.chroma_collection_external)
+        total  = ext_count(collection_name=settings.chroma_collection_external)
         elapsed = time.time() - start
-        _external_build_state["status"] = "success"
-        _external_build_state["doc_count"] = total
+        _external_build_state["status"]      = "success"
+        _external_build_state["doc_count"]    = total
         _external_build_state["record_count"] = len(all_records)
-        _external_build_state["finished_at"] = datetime.now(timezone.utc).isoformat()
+        _external_build_state["finished_at"]  = datetime.now(timezone.utc).isoformat()
         logger.info(f"✅ external_docs 重建完成：{total} 个文档，{len(all_records)} 条记录，耗时 {elapsed:.1f}s")
     except BaseException as e:
         elapsed = time.time() - start
