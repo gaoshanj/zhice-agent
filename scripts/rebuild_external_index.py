@@ -98,8 +98,9 @@ def convert_to_chunks(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not text or not company:
             continue
 
-        # 生成 chunk ID
-        chunk_id = hashlib.md5(
+        # 用飞书 record_id 作为 chunk_id（天然唯一），fallback 到 MD5
+        raw_id = record.get("record_id", "")
+        chunk_id = raw_id or hashlib.md5(
             f"external_{company}_{source_type}_{text[:100]}".encode()
         ).hexdigest()[:16]
 

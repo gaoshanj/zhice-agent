@@ -497,7 +497,8 @@ def _run_external_build() -> None:
             data = resp.json().get("data", {})
             items = data.get("items", [])
             for item in items:
-                fields = item.get("fields", {})
+                record_id  = item.get("record_id", "")
+                fields     = item.get("fields", {})
                 company    = fields.get("公司名") or ""
                 source_type = fields.get("来源类型") or ""
                 text       = (fields.get("文本") or "") or (fields.get("摘要") or "")
@@ -506,7 +507,8 @@ def _run_external_build() -> None:
                 if not text or not company:
                     continue
 
-                chunk_id = hashlib.md5(
+                # 用飞书 record_id 作为 chunk_id（天然唯一），fallback 到 MD5
+                chunk_id = record_id or hashlib.md5(
                     f"external_{company}_{source_type}_{text[:100]}".encode()
                 ).hexdigest()[:16]
                 metadata = {
