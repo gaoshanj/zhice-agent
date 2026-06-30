@@ -89,10 +89,12 @@ def retrieve_for_report_with_meta(
 
     ext_count = collection_count(settings.chroma_collection_external)
     if ext_count > 0:
+        # ⚠️ 必须按 company 过滤，否则向量语义搜索会返回其他公司的数据（跨公司泄漏）
         external_results = similarity_search(
             query=query,
             top_k=external_top_k,
             collection_name=settings.chroma_collection_external,
+            filter_dict={"company": company},
         )
         if external_results:
             logger.info(f"RAG 检索（外部）: {len(external_results)} 条结果")
