@@ -87,6 +87,33 @@ async def generate_report(
     except Exception as e:
         logger.warning(f"外部爬虫异常: {company} — {e}（继续使用已有数据生成报告）")
 
+    # ── 微软官方培训课程搜索（Phase 4 扩展）────────────────────
+    # 如果用户输入了技术产品方向，调用 Learn Catalog API 搜索相关课程
+    learn_courses: list[dict] = []
+    tech_product = parsed.get("tech_product", "")
+    if not tech_product and parsed.get("focus_areas"):
+        # fallback：用 focus_areas 拼接为搜索关键词
+        areas = parsed.get("focus_areas", [])
+        if areas:
+            tech_product = " ".join(areas)
+
+    if tech_product:
+        logger.info(f"Learn API 搜索: {company} — 技术方向：{tech_product}")
+        try:
+            from src.llm.learn_search import search_learn_courses, format_courses_for_prompt
+            learn_courses = await search_learn_courses(tech_product, max_results=5)
+            if learn_courses:
+                logger.info(f"Learn API 找到 {len(learn_courses)} 个相关课程")
+        except Exception as e:
+            logger.warning(f"Learn API 搜索失败: {e}（继续生成报告）")
+    else:
+        logger.info(f"Learn API 未触发: {company} — 未识别到技术产品方向")
+
+    learn_courses_text = ""
+    if learn_courses:
+        from src.llm.learn_search import format_courses_for_prompt
+        learn_courses_text = format_courses_for_prompt(learn_courses)
+
     # 准备模板变量
     template_vars = {
         "company": company,
@@ -95,6 +122,7 @@ async def generate_report(
         "visit_purpose": parsed.get("visit_purpose", "未指定"),
         "focus_areas": "、".join(parsed.get("focus_areas", [])) or "未指定",
         "special_req": parsed.get("special_req", "无"),
+        "learn_courses": learn_courses_text or "暂无相关微软官方培训课程信息。",
         "snapshot": "",
         "opportunity_scan": "",
         "cross_sell": "",

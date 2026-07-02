@@ -36,6 +36,7 @@ def parse_user_input(text: str) -> dict:
         "known_info": "",
         "visit_purpose": "",
         "focus_areas": [],
+        "tech_product": "",       # 技术产品方向（如 "Copilot Studio for AI Agent"）
         "special_req": "",
         "raw_text": text[:500],
     }
