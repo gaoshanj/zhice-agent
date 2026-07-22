@@ -50,30 +50,16 @@ def _read_course_list(path: str) -> list[str]:
     return nums
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="构建微软培训课程知识库 course_docs")
-    parser.add_argument("courses", nargs="*", help="课程编号（可选）")
-    parser.add_argument("--file", help="课程编号文件（每行一个）")
-    parser.add_argument("--locale", default="en-us")
-    args = parser.parse_args()
-
-    if args.courses:
-        course_numbers = args.courses
-    elif args.file:
-        course_numbers = _read_course_list(args.file)
-    else:
-        course_numbers = DEFAULT_COURSES
-
+async def run_build(course_numbers: list[str], locale: str = "en-us") -> int:
+    """构建课程知识库核心逻辑，返回写入的课程数（CLI 与 /admin 端点共用）"""
     if not course_numbers:
-        logger.error("没有要构建的课程编号，终止")
-        return
-
+        logger.error("没有要构建的课程编号")
+        return 0
     logger.info(f"开始构建课程知识库，共 {len(course_numbers)} 门课程")
-
-    parsed_list = asyncio.run(build_course_knowledge_list(course_numbers, locale=args.locale))
+    parsed_list = await build_course_knowledge_list(course_numbers, locale=locale)
     if not parsed_list:
-        logger.error("没有任何课程构建成功，终止")
-        return
+        logger.error("没有任何课程构建成功")
+        return 0
 
     chunks: list[dict] = []
     for parsed in parsed_list:
@@ -99,6 +85,30 @@ def main() -> None:
     clear_collection(settings.chroma_collection_course)
     n = add_chunks(chunks, collection_name=settings.chroma_collection_course)
     logger.info(f"课程知识库构建完成: {n} 门课程写入 {settings.chroma_collection_course}")
+    return n
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="构建微软培训课程知识库 course_docs")
+    parser.add_argument("courses", nargs="*", help="课程编号（可选）")
+    parser.add_argument("--file", help="课程编号文件（每行一个）")
+    parser.add_argument("--locale", default="en-us")
+    args = parser.parse_args()
+
+    if args.courses:
+        course_numbers = args.courses
+    elif args.file:
+        course_numbers = _read_course_list(args.file)
+    else:
+        course_numbers = DEFAULT_COURSES
+
+    if not course_numbers:
+        logger.error("没有要构建的课程编号，终止")
+        return
+
+    n = asyncio.run(run_build(course_numbers, locale=args.locale))
+    if n == 0:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

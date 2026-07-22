@@ -149,6 +149,49 @@ async def course_preview(
         raise HTTPException(status_code=500, detail=f"抓取失败: {str(e)[:500]}")
 
 
+@app.post("/admin/build-course-index", tags=["Admin"])
+async def build_course_index(
+    secret: str = Query(..., description="验证密钥"),
+    locale: str = Query("en-us", description="Locale"),
+):
+    """构建微软官方培训课程知识库（course_docs 集合）
+
+    从 Microsoft Learn Catalog 抓取课程大纲/学员对象/技术面/天数，
+    写入 course_docs 向量集合，供报告生成时语义检索最相关的 1-2 门课程。
+    课程列表优先级：scripts/course_list.txt（若存在） > 脚本内置默认列表。
+    """
+    if not settings.rebuild_index_secret:
+        raise HTTPException(status_code=501, detail="管理员未配置 REBUILD_INDEX_SECRET")
+    if secret != settings.rebuild_index_secret:
+        raise HTTPException(status_code=403, detail="密钥错误")
+
+    from scripts.build_course_index import run_build, _read_course_list, DEFAULT_COURSES
+    import os
+
+    list_path = os.path.join(os.path.dirname(__file__), "..", "scripts", "course_list.txt")
+    course_numbers = _read_course_list(list_path) if os.path.exists(list_path) else DEFAULT_COURSES
+    if not course_numbers:
+        course_numbers = DEFAULT_COURSES
+
+    async def _run_build():
+        try:
+            n = await run_build(course_numbers, locale=locale)
+            logger.info(f"课程知识库构建完成: {n} 门课")
+        except Exception as e:
+            logger.error(f"课程知识库构建失败: {e}", exc_info=True)
+
+    import asyncio
+    asyncio.create_task(_run_build())
+    return JSONResponse(
+        status_code=202,
+        content={
+            "status": "accepted",
+            "message": f"开始构建课程知识库，共 {len(course_numbers)} 门课",
+            "requested": len(course_numbers),
+        },
+    )
+
+
 @app.post("/admin/rebuild-index", tags=["Admin"])
 async def rebuild_index(secret: str = Query(..., description="验证密钥")):
     """定时重建 Wiki 索引（受密钥保护）
