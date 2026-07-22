@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import httpx
+import re
+import html
 
 from src.utils.config import settings
 from src.utils.logger import logger
@@ -278,4 +280,177 @@ def format_courses_for_prompt(courses: list[dict]) -> str:
         if url:
             lines.append(f"   🔗 {url}")
 
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────
+# 课程详情抓取（用于知识库：大纲 / 学员对象 / 技术面 / 天数）
+# 数据源：Microsoft Learn Catalog API `courses` 类型
+# ─────────────────────────────────────────────────────────────
+
+def _strip_html(raw_html: str) -> str:
+    """剥离 HTML 标签，保留纯文本"""
+    if not raw_html:
+        return ""
+    text = re.sub(r"<[^>]+>", " ", raw_html)
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _extract_audience_profile(summary_html: str) -> str:
+    """从课程 summary HTML 中提取 Audience Profile 段落文本"""
+    if not summary_html:
+        return ""
+    m = re.search(
+        r'id=["\']audience-profile["\'][^>]*>(.*?)(?=<h4|$)',
+        summary_html, re.S | re.I,
+    )
+    if not m:
+        return ""
+    return _strip_html(m.group(1))
+
+
+async def _fetch_catalog_type(type_name: str, locale: str, page_size: int = 500) -> list:
+    """拉取 Catalog API 某类型的全量数据（处理分页）"""
+    headers = {"Accept": "application/json", "User-Agent": "zhice-agent/0.2"}
+    results: list = []
+    params = {"locale": locale, "type": type_name, "pageSize": page_size}
+    async with httpx.AsyncClient(timeout=30.0, headers=headers) as client:
+        skip = 0
+        while True:
+            params["skip"] = skip
+            try:
+                resp = await client.get(_LEARN_API_URL, params=params)
+                if resp.status_code != 200:
+                    logger.warning(f"Learn API {type_name} 返回 {resp.status_code}")
+                    break
+                data = resp.json()
+            except Exception as e:
+                logger.warning(f"Learn API {type_name} 请求失败: {e}")
+                break
+
+            # 数据键名可能为 learningPaths / modules / courses
+            key = None
+            for k in ("learningPaths", "modules", "courses"):
+                if k in data:
+                    key = k
+                    break
+            items = data.get(key, []) if key else []
+            if not items:
+                break
+            results.extend(items)
+            if len(items) < page_size:
+                break
+            skip += page_size
+    return results
+
+
+async def fetch_course_detail(course_number: str, locale: str = "en-us") -> dict | None:
+    """按课程编号精确抓取单门课原始 JSON（本地匹配 course_number）"""
+    if not course_number:
+        return None
+    target = course_number.strip().upper()
+    courses = await _fetch_catalog_type("courses", locale)
+    for c in courses:
+        if str(c.get("course_number", "")).upper() == target:
+            return c
+    for c in courses:  # 兜底模糊匹配
+        if target in str(c.get("course_number", "")).upper():
+            return c
+    logger.warning(f"未找到课程: {course_number}")
+    return None
+
+
+def parse_course_detail(raw: dict) -> dict:
+    """将原始 course JSON 解析为结构化课程知识 dict
+
+    天数口径：duration_days = duration_in_hours / 6（用户确认 6 学时=1天）
+    """
+    summary_html = raw.get("summary", "")
+    duration_hours = raw.get("duration_in_hours", 0) or 0
+    duration_days = round(duration_hours / 6, 1) if duration_hours else 0
+
+    study_guide = raw.get("study_guide", []) or []
+    lp_uids = [i.get("uid") for i in study_guide if i.get("type") == "learningPath"]
+
+    return {
+        "course_number": raw.get("course_number", ""),
+        "title": raw.get("title", ""),
+        "summary_text": _strip_html(summary_html),
+        "audience_profile": _extract_audience_profile(summary_html),
+        "roles": raw.get("roles", []),
+        "products": raw.get("products", []),
+        "duration_in_hours": duration_hours,
+        "duration_days": duration_days,
+        "levels": raw.get("levels", []),
+        "study_guide_uids": lp_uids,
+        "url": raw.get("url", ""),
+        "locales": raw.get("locales", ["en"]),
+    }
+
+
+async def expand_outline(study_guide_uids: list, locale: str = "en-us") -> str:
+    """展开大纲：learningPath 标题 + 其下属 module 标题
+
+    策略：拉全量 learningPaths + modules 后在本地按 uid 匹配，
+    仅需 2 次 API 调用即可展开任意课程大纲。
+    """
+    if not study_guide_uids:
+        return ""
+
+    lps = await _fetch_catalog_type("learningPaths", locale)
+    lp_map = {lp["uid"]: lp for lp in lps if lp.get("uid")}
+
+    mod_uids: list = []
+    for uid in study_guide_uids:
+        lp = lp_map.get(uid)
+        if lp:
+            mod_uids.extend(lp.get("modules", []))
+
+    mods = await _fetch_catalog_type("modules", locale)
+    mod_map = {m["uid"]: m for m in mods if m.get("uid")}
+
+    lines: list = []
+    for uid in study_guide_uids:
+        lp = lp_map.get(uid)
+        if not lp:
+            continue
+        lines.append(f"## {lp.get('title', '')}")
+        for muid in lp.get("modules", []):
+            m = mod_map.get(muid)
+            if m:
+                lines.append(f"- {m.get('title', '')}")
+    return "\n".join(lines)
+
+
+async def fetch_course_full(course_number: str, locale: str = "en-us") -> dict:
+    """组合：抓取 + 解析 + 展开大纲，返回完整课程知识 dict（含 outline）"""
+    raw = await fetch_course_detail(course_number, locale)
+    if not raw:
+        return {}
+    parsed = parse_course_detail(raw)
+    parsed["outline"] = await expand_outline(parsed["study_guide_uids"], locale)
+    return parsed
+
+
+def format_course_knowledge(parsed: dict) -> str:
+    """将完整课程知识格式化为知识库 chunk 文本（用于 ChromaDB 存储）"""
+    if not parsed:
+        return ""
+    lines = [
+        f"# {parsed['course_number']} — {parsed['title']}",
+        f"课程编号: {parsed['course_number']}",
+        f"技术方向: {', '.join(parsed.get('products', []))}",
+        f"学员对象(角色): {', '.join(parsed.get('roles', []))}",
+        f"难度: {', '.join(parsed.get('levels', []))}",
+        f"时长: {parsed.get('duration_in_hours', 0)} 学时 (约 {parsed.get('duration_days', 0)} 天)",
+        f"课程链接: {parsed.get('url', '')}",
+        "",
+        "## 学员对象详述",
+        parsed.get("audience_profile", "") or "（无）",
+        "",
+        "## 课程大纲",
+        parsed.get("outline", "") or "（无）",
+    ]
     return "\n".join(lines)

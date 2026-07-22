@@ -122,6 +122,33 @@ def _chroma_status(collection_name: str = "") -> int:
         return -1
 
 
+@app.get("/admin/course-preview", tags=["Admin"])
+async def course_preview(
+    course: str = Query(..., description="课程编号，如 AB-620T00"),
+    secret: str = Query(..., description="验证密钥"),
+):
+    """调试端点：抓取单门课完整信息（验证 Learn API 抓取质量，不入库）"""
+    if not settings.rebuild_index_secret:
+        raise HTTPException(status_code=501, detail="管理员未配置 REBUILD_INDEX_SECRET")
+    if secret != settings.rebuild_index_secret:
+        raise HTTPException(status_code=403, detail="密钥错误")
+
+    from src.llm.learn_search import fetch_course_full, format_course_knowledge
+
+    try:
+        parsed = await fetch_course_full(course, locale="en-us")
+        if not parsed:
+            return {"found": False, "course": course}
+        return {
+            "found": True,
+            "course": course,
+            "parsed": parsed,
+            "knowledge_text": format_course_knowledge(parsed),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"抓取失败: {str(e)[:500]}")
+
+
 @app.post("/admin/rebuild-index", tags=["Admin"])
 async def rebuild_index(secret: str = Query(..., description="验证密钥")):
     """定时重建 Wiki 索引（受密钥保护）
