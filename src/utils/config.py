@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     chroma_persist_dir: str = "./chroma_data"
     chroma_collection_internal: str = "internal_docs"
     chroma_collection_external: str = "external_data"
+    chroma_collection_course: str = "course_docs"  # 微软官方培训课程知识库
 
     # 爬虫（Phase 3）
     crawler_request_delay: float = 2.0       # 请求间隔（秒）

@@ -226,3 +226,40 @@ def format_rag_context(
                 source_map[cid] = url
 
     return "\n\n".join(parts), source_map
+
+
+def course_search(query: str, top_k: int = 2) -> list[dict[str, Any]]:
+    """在 course_docs 集合中语义检索最相关的培训课程，用于融入销售策略报告。
+
+    根据客户的技术方向描述，从课程知识库中检索最相关的 1-2 门课程，
+    返回其完整知识文本（大纲 / 学员对象 / 技术面 / 天数 / 链接），
+    供 LLM 撰写「课程销售方案」并自然融入回复。
+
+    Args:
+        query: 客户技术方向描述（如 "Copilot Studio AI Agent" 或 "Azure AI 应用开发"）
+        top_k: 返回最相关的 N 门课（默认 2）
+    Returns:
+        [{"course_number", "title", "content", "url", "distance"}, ...]
+    """
+    name = settings.chroma_collection_course
+    if collection_count(name) == 0:
+        logger.info("course_docs 集合为空，跳过课程检索")
+        return []
+    try:
+        results = similarity_search(query=query, top_k=top_k, collection_name=name)
+    except Exception as e:
+        logger.warning(f"course_docs 检索失败: {e}")
+        return []
+
+    output: list[dict[str, Any]] = []
+    for r in results:
+        meta = r.get("metadata", {})
+        output.append({
+            "course_number": meta.get("course_number", ""),
+            "title": meta.get("title", ""),
+            "content": r.get("content", ""),
+            "url": meta.get("url", "") or "",
+            "distance": r.get("distance"),
+        })
+    logger.info(f"course_docs 检索: query='{query[:40]}' → {len(output)} 门课")
+    return output

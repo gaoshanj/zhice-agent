@@ -311,39 +311,30 @@ def _extract_audience_profile(summary_html: str) -> str:
     return _strip_html(m.group(1))
 
 
-async def _fetch_catalog_type(type_name: str, locale: str, page_size: int = 500) -> list:
-    """拉取 Catalog API 某类型的全量数据（处理分页）"""
-    headers = {"Accept": "application/json", "User-Agent": "zhice-agent/0.2"}
-    results: list = []
-    params = {"locale": locale, "type": type_name, "pageSize": page_size}
-    async with httpx.AsyncClient(timeout=30.0, headers=headers) as client:
-        skip = 0
-        while True:
-            params["skip"] = skip
-            try:
-                resp = await client.get(_LEARN_API_URL, params=params)
-                if resp.status_code != 200:
-                    logger.warning(f"Learn API {type_name} 返回 {resp.status_code}")
-                    break
-                data = resp.json()
-            except Exception as e:
-                logger.warning(f"Learn API {type_name} 请求失败: {e}")
-                break
+async def _fetch_catalog_type(type_name: str, locale: str, page_size: int = 5000) -> list:
+    """拉取 Catalog API 某类型的全量数据。
 
-            # 数据键名可能为 learningPaths / modules / courses
-            key = None
-            for k in ("learningPaths", "modules", "courses"):
-                if k in data:
-                    key = k
-                    break
-            items = data.get(key, []) if key else []
-            if not items:
-                break
-            results.extend(items)
-            if len(items) < page_size:
-                break
-            skip += page_size
-    return results
+    重要：Learn Catalog API 实际会在单次响应中返回该类型的全部条目，
+    并不遵守 pageSize/skip 分页参数（实测 pageSize=500 仍返回全部 3594 个 modules，
+    skip=1000000 返回的也是同一批数据）。因此这里只发起一次请求并直接取回全部数据，
+    避免基于 skip 的分页循环陷入死循环。page_size 仅作占位，API 会忽略它。
+    """
+    headers = {"Accept": "application/json", "User-Agent": "zhice-agent/0.2"}
+    params = {"locale": locale, "type": type_name, "pageSize": page_size}
+    async with httpx.AsyncClient(timeout=60.0, headers=headers) as client:
+        try:
+            resp = await client.get(_LEARN_API_URL, params=params)
+            if resp.status_code != 200:
+                logger.warning(f"Learn API {type_name} 返回 {resp.status_code}: {resp.text[:200]}")
+                return []
+            data = resp.json()
+        except Exception as e:
+            logger.warning(f"Learn API {type_name} 请求失败: {e}")
+            return []
+
+        # 数据键名可能为 learningPaths / modules / courses
+        key = next((k for k in ("learningPaths", "modules", "courses") if k in data), None)
+        return data.get(key, []) if key else []
 
 
 async def fetch_course_detail(course_number: str, locale: str = "en-us") -> dict | None:
@@ -454,3 +445,71 @@ def format_course_knowledge(parsed: dict) -> str:
         parsed.get("outline", "") or "（无）",
     ]
     return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────
+# 批量构建（用于知识库入库：仅拉取 1 次全量目录，内存中展开大纲）
+# ─────────────────────────────────────────────────────────────
+
+async def fetch_catalog_once(locale: str = "en-us") -> dict:
+    """一次性拉取 courses / learningPaths / modules 全量（各 1 次请求，并行）
+
+    返回 {"courses": [...], "learningPaths": [...], "modules": [...] }。
+    由于 Learn API 会在单次响应中返回该类型全部条目，3 次请求即可拿到完整目录，
+    后续批量课程处理全部在内存中完成，无需重复请求。
+    """
+    courses, lps, mods = await asyncio.gather(
+        _fetch_catalog_type("courses", locale),
+        _fetch_catalog_type("learningPaths", locale),
+        _fetch_catalog_type("modules", locale),
+    )
+    return {"courses": courses, "learningPaths": lps, "modules": mods}
+
+
+def _expand_outline_with(lp_map: dict, mod_map: dict, study_guide_uids: list) -> str:
+    """基于内存中的 learningPaths/modules 映射展开大纲（不触发网络请求）"""
+    if not study_guide_uids:
+        return ""
+    lines: list = []
+    for uid in study_guide_uids:
+        lp = lp_map.get(uid)
+        if not lp:
+            continue
+        lines.append(f"## {lp.get('title', '')}")
+        for muid in lp.get("modules", []):
+            m = mod_map.get(muid)
+            if m:
+                lines.append(f"- {m.get('title', '')}")
+    return "\n".join(lines)
+
+
+async def build_course_knowledge_list(course_numbers: list[str], locale: str = "en-us") -> list[dict]:
+    """批量构建课程知识（仅拉取 1 次全量目录，内存中展开大纲）
+
+    Args:
+        course_numbers: 课程编号列表，如 ["AB-620T00", "GH-200T00"]
+    Returns:
+        list[dict]: 每个课程的完整知识 dict（含 outline），找不到的课程会被跳过
+    """
+    catalog = await fetch_catalog_once(locale)
+    courses_map = {str(c.get("course_number", "")).upper(): c for c in catalog["courses"]}
+    lp_map = {lp["uid"]: lp for lp in catalog["learningPaths"] if lp.get("uid")}
+    mod_map = {m["uid"]: m for m in catalog["modules"] if m.get("uid")}
+
+    results: list[dict] = []
+    for num in course_numbers:
+        target = num.strip().upper()
+        raw = courses_map.get(target)
+        if not raw:  # 兜底模糊匹配
+            for k, c in courses_map.items():
+                if target in k:
+                    raw = c
+                    break
+        if not raw:
+            logger.warning(f"build_course_knowledge_list: 未找到课程 {num}")
+            continue
+        parsed = parse_course_detail(raw)
+        parsed["outline"] = _expand_outline_with(lp_map, mod_map, parsed["study_guide_uids"])
+        results.append(parsed)
+    logger.info(f"build_course_knowledge_list: {len(results)}/{len(course_numbers)} 门课程构建完成")
+    return results
