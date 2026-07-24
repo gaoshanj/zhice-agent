@@ -104,6 +104,7 @@ async def health():
         "embedding_configured": bool(settings.azure_embedding_deployment),
         "chroma_docs":          _chroma_status(),
         "chroma_docs_external": _chroma_status(collection_name=settings.chroma_collection_external),
+        "course_docs":          _chroma_status(collection_name=settings.chroma_collection_course),
         "chroma_persist_dir":  settings.chroma_persist_dir,
         "bitable_build_state": _bitable_build_state.get("status"),
     }
