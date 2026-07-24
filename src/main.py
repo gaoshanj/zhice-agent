@@ -430,6 +430,60 @@ def _auto_build_on_startup():
     if ext_docs > 0 and ext_stored_version < _CHROMA_EXTERNAL_SCHEMA_VERSION:
         need_external_clear = True
 
+    # ── 课程知识库检查（course_docs）─────────────────────────
+    # 课程库不参与 Bitable/爬虫，需单独从 Learn API 构建。
+    # 触发条件（任一满足即后台构建，不阻塞启动）：
+    #   1. course_docs 为空（首次部署 / 索引被清空）
+    #   2. 存在 scripts/course_list.txt（用户已提供完整 Course Map，优先用它重建）
+    # 若已构建且无 course_list.txt，则跳过（保留已写入的默认课程，避免每次冷启动重复抓取）
+    need_course_build = False
+    try:
+        course_docs = collection_count(settings.chroma_collection_course)
+    except Exception:
+        course_docs = -1
+
+    list_path = os.path.join(os.path.dirname(__file__), "..", "scripts", "course_list.txt")
+    has_course_list = os.path.exists(list_path)
+
+    if course_docs <= 0:
+        need_course_build = True
+        build_reason = "集合为空"
+    elif has_course_list:
+        need_course_build = True
+        build_reason = f"检测到 course_list.txt，使用完整课程列表重建（现有 {course_docs} 条）"
+
+    if need_course_build:
+        logger.warning(
+            f"⚠️ course_docs 需构建: {build_reason}，将在后台启动构建..."
+        )
+
+        def _delayed_course_build():
+            import time as _time
+            import asyncio as _asyncio
+
+            _time.sleep(30)  # 等 Azure 就绪 + 错开 Bitable 重建
+            try:
+                from scripts.build_course_index import (
+                    run_build,
+                    _read_course_list,
+                    DEFAULT_COURSES,
+                )
+
+                nums = _read_course_list(list_path) if has_course_list else DEFAULT_COURSES
+                if not nums:
+                    nums = DEFAULT_COURSES
+                n = _asyncio.run(run_build(nums, locale="en-us"))
+                logger.info(f"course_docs 后台构建完成: {n} 门课")
+            except Exception as e:
+                logger.error(f"course_docs 后台构建失败: {e}", exc_info=True)
+
+        t = threading.Thread(
+            target=_delayed_course_build, daemon=True, name="auto-course-build"
+        )
+        t.start()
+    else:
+        logger.info(f"📊 ChromaDB course_docs: {course_docs} 条（已就绪）")
+
     # ── 内部集合重建 ──────────────────────────────────────────
     if need_internal_rebuild:
         reason = "集合为空" if int_docs <= 0 else (
