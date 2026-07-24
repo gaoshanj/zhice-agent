@@ -357,13 +357,18 @@ def _run_bitable_build():
             _bitable_build_state["status"] = "success"
             _bitable_build_state["doc_count"] = doc_count
             # 写入 schema 版本标记，下次启动时用于判断是否需要重建
+            # 注意：ChromaDB 不允许 modify 时改动 hnsw:space（距离函数），否则报
+            # "Changing the distance function of a collection once it is created is
+            # not supported"。因此只更新 schema_version，剔除所有 hnsw:* 键
+            # （集合向量索引的距离函数已固化在索引文件里，modify 不动它即不受影响）。
             try:
                 coll = _get_collection(settings.chroma_collection_internal)
-                coll.modify(metadata={
-                    **(coll.metadata if coll.metadata else {}),
-                    "schema_version": str(_CHROMA_SCHEMA_VERSION),
-                    "hnsw:space": "cosine",  # 保留原有配置
-                })
+                safe_metadata = {
+                    k: v for k, v in (coll.metadata or {}).items()
+                    if not k.startswith("hnsw:")
+                }
+                safe_metadata["schema_version"] = str(_CHROMA_SCHEMA_VERSION)
+                coll.modify(metadata=safe_metadata)
             except Exception as ve:
                 logger.warning(f"写入 schema_version 失败: {ve}")
             logger.info(f"✅ Bitable 索引构建完成（耗时 {elapsed:.1f}s，共 {doc_count} 条）")
@@ -518,9 +523,14 @@ def _auto_build_on_startup():
         try:
             from src.rag.vector_store import clear_collection
             clear_collection(settings.chroma_collection_external)
-            # 写入新版 schema version
+            # 写入新版 schema version（同样剔除 hnsw:*，避免改动距离函数报错）
             ext_coll = _get_collection(settings.chroma_collection_external)
-            ext_coll.modify(metadata={"schema_version": str(_CHROMA_EXTERNAL_SCHEMA_VERSION)})
+            ext_meta = {
+                k: v for k, v in (ext_coll.metadata or {}).items()
+                if not k.startswith("hnsw:")
+            }
+            ext_meta["schema_version"] = str(_CHROMA_EXTERNAL_SCHEMA_VERSION)
+            ext_coll.modify(metadata=ext_meta)
             logger.info("✅ external_docs 已清空并更新 schema version")
         except Exception as e:
             logger.error(f"清空 external_docs 失败: {e}")
