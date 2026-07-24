@@ -1,9 +1,10 @@
 """飞书消息卡片构建器 — Phase 1 实现
 
-根据项目规格文档，报告卡片包含 6 个章节：
+报告卡片包含 7 个章节（顺序固定）：
   1. 客户 360° 快照
   2. 培训商机深度扫描
   3. 交叉销售机会挖掘
+  3.5 微软培训课程方案（插入于交叉销售与销售策略之间）
   4. 销售策略建议
   5. 推荐销售话术
   6. 行动建议
@@ -61,6 +62,7 @@ def build_report_card(report_data: dict[str, Any]) -> dict[str, Any]:
         "snapshot": str,           # 客户快照
         "opportunity_scan": str,    # 商机扫描
         "cross_sell": str,          # 交叉销售
+        "course_plan": str,         # 微软培训课程方案（名称/链接/受众/大纲）
         "strategy": str,            # 销售策略
         "talk_script": str,         # 话术
         "action_plan": str,         # 行动建议
@@ -86,6 +88,12 @@ def build_report_card(report_data: dict[str, Any]) -> dict[str, Any]:
     cross = report_data.get("cross_sell", "")
     if cross:
         elements.append(_div(f"**🔗 交叉销售机会**\n\n{cross}"))
+        elements.append(_hr())
+
+    # ── 3.5 微软培训课程方案（位于交叉销售与销售策略之间）──
+    course_plan = report_data.get("course_plan", "")
+    if course_plan:
+        elements.append(_div(f"**🎓 微软培训课程方案**\n\n{course_plan}"))
         elements.append(_hr())
 
     # ── 4. 销售策略建议 ──

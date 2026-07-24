@@ -18,6 +18,7 @@ SECTION_NAMES = [
     "snapshot",
     "opportunity_scan",
     "cross_sell",
+    "course_plan",
     "strategy",
     "talk_script",
     "action_plan",
@@ -27,6 +28,7 @@ SECTION_LABELS = [
     "客户 360° 快照",
     "培训商机深度扫描",
     "交叉销售机会挖掘",
+    "微软培训课程方案",
     "销售策略建议",
     "推荐销售话术",
     "行动建议",
@@ -123,6 +125,7 @@ async def generate_report(
         "focus_areas": "、".join(parsed.get("focus_areas", [])) or "未指定",
         "special_req": parsed.get("special_req", "无"),
         "learn_courses": learn_courses_text or "暂无相关微软官方培训课程信息。",
+        "course_plan": "",
         "snapshot": "",
         "opportunity_scan": "",
         "cross_sell": "",
@@ -138,8 +141,8 @@ async def generate_report(
 
     t_report_start = time.monotonic()
 
-    # ── 顺序生成有依赖的章节（1→2→4）─────────────────────────
-    sequential_sections = [1, 2, 4]
+    # ── 顺序生成有依赖的章节（1→2→4→5：快照/商机/课程方案/策略）──
+    sequential_sections = [1, 2, 4, 5]
     for section_num in sequential_sections:
         label = SECTION_LABELS[section_num - 1]
         logger.info(f"生成第 {section_num} 节: {label}")
@@ -162,6 +165,9 @@ async def generate_report(
             elif section_num == 2:
                 template_vars["opportunity_scan"] = _truncate(content, 200)
             elif section_num == 4:
+                # 课程方案：完整文本注入，供「销售策略建议」引用课程名称/大纲
+                template_vars["course_plan"] = content
+            elif section_num == 5:
                 template_vars["strategy"] = _truncate(content, 200)
 
         except Exception as e:
@@ -176,29 +182,29 @@ async def generate_report(
     report_data["sections"]["3"] = content
     template_vars["cross_sell"] = content
 
-    # ── 并行生成无依赖的章节（5 和 6 都只依赖 S4 的 strategy）───
-    logger.info("并行生成第 5、6 节...")
-    s5_task = asyncio.create_task(
-        _generate_section(5, template_vars, max_tokens=4000, reasoning_effort=reasoning_effort, company_ctx=company_ctx)
-    )
+    # ── 并行生成无依赖的章节（6 和 7 都只依赖 S5 的 strategy）───
+    logger.info("并行生成第 6、7 节...")
     s6_task = asyncio.create_task(
         _generate_section(6, template_vars, max_tokens=4000, reasoning_effort=reasoning_effort, company_ctx=company_ctx)
     )
-
-    try:
-        s5_content = await s5_task
-        report_data["talk_script"] = s5_content
-        report_data["sections"]["5"] = s5_content
-    except Exception as e:
-        logger.error(f"第 5 节生成失败: {e}")
-        report_data["talk_script"] = f"[生成失败：{str(e)[:200]}]"
+    s7_task = asyncio.create_task(
+        _generate_section(7, template_vars, max_tokens=4000, reasoning_effort=reasoning_effort, company_ctx=company_ctx)
+    )
 
     try:
         s6_content = await s6_task
-        report_data["action_plan"] = s6_content
+        report_data["talk_script"] = s6_content
         report_data["sections"]["6"] = s6_content
     except Exception as e:
         logger.error(f"第 6 节生成失败: {e}")
+        report_data["talk_script"] = f"[生成失败：{str(e)[:200]}]"
+
+    try:
+        s7_content = await s7_task
+        report_data["action_plan"] = s7_content
+        report_data["sections"]["7"] = s7_content
+    except Exception as e:
+        logger.error(f"第 7 节生成失败: {e}")
         report_data["action_plan"] = f"[生成失败：{str(e)[:200]}]"
 
     # ── 收集 RAG 来源（去重）──────────────────────────────────
@@ -223,7 +229,7 @@ def _collect_sources(
     sources: list[dict[str, str]] = []
 
     # 对每一节都检索一次，收集所有 Bitable 来源
-    for section_num in (1, 2, 4, 5, 6):
+    for section_num in (1, 2, 5, 6, 7):
         try:
             results = retrieve_for_report_with_meta(company, section_num, top_k=3)
             for r in results:
@@ -281,7 +287,12 @@ async def _generate_section(
 
     t_start = time.monotonic()
     company = template_vars.get("company", "")
-    contexts = retrieve_for_report_with_meta(company, section_num)
+    # 课程方案（第 4 节）仅依赖 course_docs 素材，不注入内部/外部 RAG，
+    # 避免把公司知识库来源编号 [来源N] 混进课程卡片。
+    if section_num == 4:
+        contexts = []
+    else:
+        contexts = retrieve_for_report_with_meta(company, section_num)
     rag_context, source_map = format_rag_context(contexts)
 
     if rag_context:
