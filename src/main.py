@@ -166,17 +166,34 @@ async def build_course_index(
     if secret != settings.rebuild_index_secret:
         raise HTTPException(status_code=403, detail="密钥错误")
 
-    from scripts.build_course_index import run_build, _read_course_list, DEFAULT_COURSES
+    from scripts.build_course_index import (
+        run_build,
+        run_build_from_xlsx,
+        _read_course_list,
+        DEFAULT_COURSES,
+        DEFAULT_XLSX,
+    )
     import os
 
+    xlsx_path = DEFAULT_XLSX
     list_path = os.path.join(os.path.dirname(__file__), "..", "scripts", "course_list.txt")
-    course_numbers = _read_course_list(list_path) if os.path.exists(list_path) else DEFAULT_COURSES
-    if not course_numbers:
+
+    # 优先级：课程表 xlsx（字段优先）> course_list.txt > 默认列表
+    if os.path.exists(xlsx_path):
+        requested = f"课程表 {os.path.basename(xlsx_path)}"
+        build_coro = run_build_from_xlsx(xlsx_path, locale=locale)
+    elif os.path.exists(list_path):
+        course_numbers = _read_course_list(list_path) or DEFAULT_COURSES
+        requested = f"course_list.txt（{len(course_numbers)} 门）"
+        build_coro = run_build(course_numbers, locale=locale)
+    else:
         course_numbers = DEFAULT_COURSES
+        requested = f"默认列表（{len(course_numbers)} 门）"
+        build_coro = run_build(course_numbers, locale=locale)
 
     async def _run_build():
         try:
-            n = await run_build(course_numbers, locale=locale)
+            n = await build_coro
             logger.info(f"课程知识库构建完成: {n} 门课")
         except Exception as e:
             logger.error(f"课程知识库构建失败: {e}", exc_info=True)
@@ -187,8 +204,8 @@ async def build_course_index(
         status_code=202,
         content={
             "status": "accepted",
-            "message": f"开始构建课程知识库，共 {len(course_numbers)} 门课",
-            "requested": len(course_numbers),
+            "message": f"开始构建课程知识库（{requested}）",
+            "requested": requested,
         },
     )
 
@@ -471,14 +488,20 @@ def _auto_build_on_startup():
             try:
                 from scripts.build_course_index import (
                     run_build,
+                    run_build_from_xlsx,
                     _read_course_list,
                     DEFAULT_COURSES,
+                    DEFAULT_XLSX,
                 )
 
-                nums = _read_course_list(list_path) if has_course_list else DEFAULT_COURSES
-                if not nums:
-                    nums = DEFAULT_COURSES
-                n = _asyncio.run(run_build(nums, locale="en-us"))
+                # 优先级：课程表 xlsx（字段优先）> course_list.txt > 默认列表
+                if os.path.exists(DEFAULT_XLSX):
+                    n = _asyncio.run(run_build_from_xlsx(DEFAULT_XLSX, locale="en-us"))
+                elif has_course_list:
+                    nums = _read_course_list(list_path) or DEFAULT_COURSES
+                    n = _asyncio.run(run_build(nums, locale="en-us"))
+                else:
+                    n = _asyncio.run(run_build(DEFAULT_COURSES, locale="en-us"))
                 logger.info(f"course_docs 后台构建完成: {n} 门课")
             except Exception as e:
                 logger.error(f"course_docs 后台构建失败: {e}", exc_info=True)

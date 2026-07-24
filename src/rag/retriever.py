@@ -229,16 +229,16 @@ def format_rag_context(
     return "\n\n".join(parts), source_map
 
 
-def course_search(query: str, top_k: int = 2) -> list[dict[str, Any]]:
+def course_search(query: str, top_k: int = 1) -> list[dict[str, Any]]:
     """在 course_docs 集合中语义检索最相关的培训课程，用于融入销售策略报告。
 
-    根据客户的技术方向描述，从课程知识库中检索最相关的 1-2 门课程，
+    根据客户的技术方向描述，从课程知识库中检索最相关的 1 门课程，
     返回其完整知识文本（大纲 / 学员对象 / 技术面 / 天数 / 链接），
     供 LLM 撰写「课程销售方案」并自然融入回复。
 
     Args:
         query: 客户技术方向描述（如 "Copilot Studio AI Agent" 或 "Azure AI 应用开发"）
-        top_k: 返回最相关的 N 门课（默认 2）
+        top_k: 返回最相关的 N 门课（默认 1，避免报告截断）
     Returns:
         [{"course_number", "title", "content", "url", "distance"}, ...]
     """

@@ -90,7 +90,7 @@ async def generate_report(
         logger.warning(f"外部爬虫异常: {company} — {e}（继续使用已有数据生成报告）")
 
     # ── 微软官方培训课程检索（基于 course_docs 知识库，离线语义检索）──
-    # 根据客户技术方向，从课程知识库中检索最相关的 1-2 门课程，
+    # 根据客户技术方向，从课程知识库中检索最相关的 1 门课程，
     # 将其完整知识（大纲/学员对象/技术面/天数/链接）作为销售方案素材融入报告。
     learn_courses_text = "暂无相关微软官方培训课程信息。"
     tech_query = parsed.get("tech_product", "")
@@ -104,7 +104,7 @@ async def generate_report(
         logger.info(f"course_docs 检索: {company} — 技术方向：{tech_query}")
         try:
             from src.rag.retriever import course_search
-            courses = course_search(tech_query, top_k=2)
+            courses = course_search(tech_query, top_k=1)
             if courses:
                 learn_courses_text = "\n\n".join(c["content"] for c in courses)
                 logger.info(

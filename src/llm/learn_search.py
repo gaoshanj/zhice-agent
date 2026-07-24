@@ -429,10 +429,22 @@ def format_course_knowledge(parsed: dict) -> str:
     """将完整课程知识格式化为知识库 chunk 文本（用于 ChromaDB 存储）"""
     if not parsed:
         return ""
+    title = parsed.get("title") or parsed.get("course_number") or "未知课程"
+    sa = parsed.get("solution_area", "")
+    cred = parsed.get("credential", "")
+    state = parsed.get("state", "")
+    extra: list[str] = []
+    if sa:
+        extra.append(f"Solution Area: {sa}")
+    if cred:
+        extra.append(f"认证类型: {cred}")
+    if state:
+        extra.append(f"状态: {state}")
     lines = [
-        f"# {parsed['course_number']} — {parsed['title']}",
+        f"# {parsed['course_number']} — {title}",
         f"课程编号: {parsed['course_number']}",
         f"技术方向: {', '.join(parsed.get('products', []))}",
+        *extra,
         f"学员对象(角色): {', '.join(parsed.get('roles', []))}",
         f"难度: {', '.join(parsed.get('levels', []))}",
         f"时长: {parsed.get('duration_in_hours', 0)} 学时 (约 {parsed.get('duration_days', 0)} 天)",
@@ -512,4 +524,108 @@ async def build_course_knowledge_list(course_numbers: list[str], locale: str = "
         parsed["outline"] = _expand_outline_with(lp_map, mod_map, parsed["study_guide_uids"])
         results.append(parsed)
     logger.info(f"build_course_knowledge_list: {len(results)}/{len(course_numbers)} 门课程构建完成")
+    return results
+
+
+def _parse_table_duration(text: str) -> tuple[float, float]:
+    """解析课程表中形如 '3 day' / '2 days' 的时长文本 → (学时, 天数)
+
+    天数口径沿用项目约定：1 天 = 6 学时（duration_in_hours = days * 6）。
+    无法解析时返回 (0, 0)。
+    """
+    if not text:
+        return 0.0, 0.0
+    m = re.search(r"(\d+)\s*day", str(text), re.I)
+    if not m:
+        return 0.0, 0.0
+    days = int(m.group(1))
+    hours = round(days * 6, 1)
+    return hours, days
+
+
+# Solution Area → 技术产品关键词（仅当 Learn API 未提供 products 时采用，用于丰富检索）
+_SOLUTION_AREA_PRODUCT_MAP = {
+    "business applications": ["dynamics-365", "power-platform"],
+    "azure": ["azure"],
+    "ai": ["azure-ai", "ai"],
+    "security": ["security"],
+    "modern work": ["microsoft-365"],
+    "data": ["azure"],
+    "devops": ["azure-devops"],
+}
+
+
+def _products_from_solution_area(solution_area: str) -> list[str]:
+    if not solution_area:
+        return []
+    sa = solution_area.strip().lower()
+    for key, ids in _SOLUTION_AREA_PRODUCT_MAP.items():
+        if key in sa:
+            return ids
+    return []
+
+
+async def build_course_from_rows(rows: list[dict], locale: str = "en-us") -> list[dict]:
+    """基于「课程表」逐行构建课程知识（表格字段优先级最高）
+
+    表格提供：课程编号 / 标题 / 链接 / 天数 / Solution Area / Credential / State 等。
+    Learn API 仅用于补充表格没有的字段（学员对象 audience、课程大纲 outline、
+    roles、levels、products）。当同一字段表格与 Learn 都有值时，以表格为准。
+
+    Args:
+        rows: 规范化后的课程表行列表，每行含键：
+              course_number, title, duration, detail_page_url,
+              solution_area, credential, state
+        locale: Learn API locale
+    Returns:
+        list[dict]: 完整课程知识 dict 列表（含 outline）。找不到 Learn 详情的课程
+                    仍会用表格字段构建（audience/outline 标为暂无）。
+    """
+    # 仅拉取 1 次全量目录用于大纲/受众补充（3 次请求）
+    catalog = await fetch_catalog_once(locale)
+    courses_map = {str(c.get("course_number", "")).upper(): c for c in catalog["courses"]}
+    lp_map = {lp["uid"]: lp for lp in catalog["learningPaths"] if lp.get("uid")}
+    mod_map = {m["uid"]: m for m in catalog["modules"] if m.get("uid")}
+
+    results: list[dict] = []
+    for row in rows:
+        num = str(row.get("course_number", "")).strip().upper()
+        if not num:
+            continue
+        hours, days = _parse_table_duration(row.get("duration", ""))
+        # 表格字段（优先）
+        parsed = {
+            "course_number": num,
+            "title": (row.get("title") or "").strip(),
+            "url": (row.get("detail_page_url") or row.get("url") or "").strip(),
+            "duration_in_hours": hours,
+            "duration_days": days,
+            "solution_area": (row.get("solution_area") or "").strip(),
+            "credential": (row.get("credential") or "").strip(),
+            "state": (row.get("state") or "").strip(),
+            "products": _products_from_solution_area(row.get("solution_area", "")),
+            "roles": [],
+            "levels": [],
+            "audience_profile": "",
+            "outline": "",
+        }
+
+        # Learn API 补充（仅当表格缺字段时采用，保证表格优先级）
+        raw = courses_map.get(num)
+        if raw:
+            learn = parse_course_detail(raw)
+            learn["outline"] = _expand_outline_with(lp_map, mod_map, learn["study_guide_uids"])
+            parsed["audience_profile"] = parsed["audience_profile"] or learn.get("audience_profile", "")
+            parsed["outline"] = parsed["outline"] or learn.get("outline", "")
+            parsed["roles"] = parsed["roles"] or learn.get("roles", [])
+            parsed["levels"] = parsed["levels"] or learn.get("levels", [])
+            parsed["products"] = parsed["products"] or learn.get("products", [])
+            parsed["title"] = parsed["title"] or learn.get("title", "")
+            parsed["url"] = parsed["url"] or learn.get("url", "")
+        else:
+            logger.warning(f"build_course_from_rows: 课程不在 Learn 目录（仅用表格字段）: {num}")
+
+        results.append(parsed)
+
+    logger.info(f"build_course_from_rows: {len(results)} 门课程（含表格字段）构建完成")
     return results
