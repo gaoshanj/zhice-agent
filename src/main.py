@@ -454,11 +454,12 @@ def _auto_build_on_startup():
         need_external_clear = True
 
     # ── 课程知识库检查（course_docs）─────────────────────────
-    # 课程库不参与 Bitable/爬虫，需单独从 Learn API 构建。
+    # 课程库不参与 Bitable/爬虫，需单独从课程表 / Learn API 构建。
     # 触发条件（任一满足即后台构建，不阻塞启动）：
     #   1. course_docs 为空（首次部署 / 索引被清空）
-    #   2. 存在 scripts/course_list.txt（用户已提供完整 Course Map，优先用它重建）
-    # 若已构建且无 course_list.txt，则跳过（保留已写入的默认课程，避免每次冷启动重复抓取）
+    #   2. 存在 data/course_catalog.xlsx（课程表，字段优先）→ 当现有条数 != 课程表行数时重建
+    #   3. 存在 scripts/course_list.txt（用户已提供完整 Course Map）
+    # 若已构建且无课程表 / course_list.txt，则跳过（避免每次冷启动重复抓取）
     need_course_build = False
     try:
         course_docs = collection_count(settings.chroma_collection_course)
@@ -468,9 +469,26 @@ def _auto_build_on_startup():
     list_path = os.path.join(os.path.dirname(__file__), "..", "scripts", "course_list.txt")
     has_course_list = os.path.exists(list_path)
 
+    # 课程表（字段优先）路径，与 build_course_index.DEFAULT_XLSX 保持一致
+    xlsx_path = os.path.join(os.path.dirname(__file__), "..", "data", "course_catalog.xlsx")
+    has_xlsx = os.path.exists(xlsx_path)
+    xlsx_expected = 0
+    if has_xlsx:
+        try:
+            from scripts.build_course_index import count_xlsx_rows
+            xlsx_expected = count_xlsx_rows(xlsx_path)
+        except Exception as _e:
+            logger.warning(f"读取课程表行数失败: {_e}")
+            xlsx_expected = 0
+
     if course_docs <= 0:
         need_course_build = True
         build_reason = "集合为空"
+    elif has_xlsx and xlsx_expected and course_docs != xlsx_expected:
+        need_course_build = True
+        build_reason = (
+            f"课程表 {xlsx_expected} 门与现有 {course_docs} 条不一致，用课程表重建"
+        )
     elif has_course_list:
         need_course_build = True
         build_reason = f"检测到 course_list.txt，使用完整课程列表重建（现有 {course_docs} 条）"

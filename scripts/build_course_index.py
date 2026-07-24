@@ -173,6 +173,11 @@ async def run_build_from_xlsx(xlsx_path: str, locale: str = "en-us") -> int:
     return _write_chunks(parsed_list)
 
 
+def count_xlsx_rows(path: str) -> int:
+    """返回课程表中有效课程行数（用于启动自检判断是否需要重建）"""
+    return len(_read_course_xlsx(path))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="构建微软培训课程知识库 course_docs")
     parser.add_argument("courses", nargs="*", help="课程编号（可选）")
