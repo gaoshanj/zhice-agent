@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from src.rag.vector_store import similarity_search, collection_count
@@ -229,25 +230,62 @@ def format_rag_context(
     return "\n\n".join(parts), source_map
 
 
-def course_search(query: str, top_k: int = 1) -> list[dict[str, Any]]:
+def _field_has_content(text: str) -> bool:
+    """判断某字段内容是否算「有信息」——排除占位符与空白
+
+    format_course_knowledge 在缺失字段时写入「（无）」占位符；
+    空文本或占位符均视为无信息。
+    """
+    if not text:
+        return False
+    t = text.strip()
+    if t in ("（无）", "(无)", "（暂无）", "（暂无）", "暂无", "暂无信息", ""):
+        return False
+    return len(t) >= 5
+
+
+def _course_completeness(content: str) -> int:
+    """评估课程信息完整度，供检索重排使用。
+
+    依据 course_docs 中 format_course_knowledge 生成的文本结构判断：
+      - 「## 学员对象详述」段：有实质内容 +1
+      - 「## 课程大纲」段：有实质内容 +1
+    返回 0~2（2=受众+大纲都完整，0=都缺失）。
+    """
+    score = 0
+    m_aud = re.search(r"## 学员对象详述\s*(.*?)(?=\n## |\Z)", content, re.S)
+    if m_aud and _field_has_content(m_aud.group(1)):
+        score += 1
+    m_out = re.search(r"## 课程大纲\s*(.*?)(?=\n## |\Z)", content, re.S)
+    if m_out and _field_has_content(m_out.group(1)):
+        score += 1
+    return score
+
+
+def course_search(query: str, top_k: int = 1, candidate_k: int = 8) -> list[dict[str, Any]]:
     """在 course_docs 集合中语义检索最相关的培训课程，用于融入销售策略报告。
 
-    根据客户的技术方向描述，从课程知识库中检索最相关的 1 门课程，
-    返回其完整知识文本（大纲 / 学员对象 / 技术面 / 天数 / 链接），
-    供 LLM 撰写「课程销售方案」并自然融入回复。
+    排序策略（用户要求：信息完整性好的课程优先输出）：
+      1. 先按语义相似度取 candidate_k（默认 8）门候选；
+      2. 重排：完整度（受众+大纲）优先，同完整度内再按距离（越近越优）排序；
+      3. 返回 top_k 门（默认 1，避免报告截断）作为最终输出。
+
+    这样在「相关候选」中，信息完整的课程会优先被选中输出，
+    避免把受众/大纲为「（无）」的残缺课程推到报告里。
 
     Args:
         query: 客户技术方向描述（如 "Copilot Studio AI Agent" 或 "Azure AI 应用开发"）
-        top_k: 返回最相关的 N 门课（默认 1，避免报告截断）
+        top_k: 最终返回门数（默认 1，避免报告截断）
+        candidate_k: 相似度候选池大小（用于完整度重排，默认 8）
     Returns:
-        [{"course_number", "title", "content", "url", "distance"}, ...]
+        [{"course_number", "title", "content", "url", "distance", "completeness"}, ...]
     """
     name = settings.chroma_collection_course
     if collection_count(name) == 0:
         logger.info("course_docs 集合为空，跳过课程检索")
         return []
     try:
-        results = similarity_search(query=query, top_k=top_k, collection_name=name)
+        results = similarity_search(query=query, top_k=candidate_k, collection_name=name)
     except Exception as e:
         logger.warning(f"course_docs 检索失败: {e}")
         return []
@@ -255,12 +293,23 @@ def course_search(query: str, top_k: int = 1) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
     for r in results:
         meta = r.get("metadata", {})
+        content = r.get("content", "")
         output.append({
             "course_number": meta.get("course_number", ""),
             "title": meta.get("title", ""),
-            "content": r.get("content", ""),
+            "content": content,
             "url": meta.get("url", "") or "",
             "distance": r.get("distance"),
+            "completeness": _course_completeness(content),
         })
-    logger.info(f"course_docs 检索: query='{query[:40]}' → {len(output)} 门课")
-    return output
+
+    # ── 重排：完整度优先，其次相似度（distance 越小越相关）──
+    output.sort(key=lambda c: (-c["completeness"], c["distance"] or 0))
+
+    chosen = output[:top_k]
+    logger.info(
+        f"course_docs 检索: query='{query[:40]}' → 候选 {len(output)} 门，"
+        f"选中 {len(chosen)} 门: "
+        f"{[(c['course_number'], c['completeness']) for c in chosen]}"
+    )
+    return chosen
