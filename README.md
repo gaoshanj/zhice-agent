@@ -198,6 +198,7 @@ uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
 - 模块级共享函数必须模块级导入，不可仅在内部函数中导入
 - Bing 中文搜索不要用引号 — 引号破坏中文分词
 - 本地 git push 需 `-c http.version=HTTP/1.1`
+- 📌 **换 AI 工具 / 换电脑接手本项目，先看 [`AI_MEMORY.md`](./AI_MEMORY.md)** —— 可移植开发记忆（架构、微软课程功能、全套踩坑、上线 SOP）
 
 ## 测试
 
@@ -205,7 +206,7 @@ uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
 pytest tests/ -v
 ```
 
-- 12/12 单元测试全部通过，零回归
+- 17/17 单元测试全部通过（含 `tests/test_course_search.py` 5 用例），零回归
 - 报告端到端耗时 ~100s（reasoning_effort=low）
 
 ## 许可证
